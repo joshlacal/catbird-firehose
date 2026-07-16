@@ -17,10 +17,10 @@ catbird-firehose-fanout = { path = "crates/fanout" }
 catbird-firehose-consumer-push = { path = "crates/consumer-push" }
 
 # AT Protocol (jacquard)
-jacquard = { version = "0.9", default-features = false, features = ["api_full", "streaming", "dns", "cache"] }
-jacquard-common = { version = "0.9", features = ["reqwest-client", "websocket"] }
-jacquard-api = { version = "0.9", features = ["bluesky", "streaming"] }
-jacquard-identity = { version = "0.9", features = ["dns", "cache"] }
+jacquard = { version = "=0.12.1", default-features = false, features = ["api_full", "streaming", "dns", "cache"] }
+jacquard-common = { version = "=0.12.1", features = ["reqwest-client", "websocket"] }
+jacquard-api = { version = "=0.12.1", features = ["bluesky", "streaming"] }
+jacquard-identity = { version = "=0.12.1", features = ["dns", "cache"] }
 
 # AT Protocol (atrium - kept for CAR parsing)
 atrium-repo = "0.1.5"
