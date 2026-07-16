@@ -11,10 +11,10 @@ use futures::StreamExt;
 use jacquard_api::com_atproto::sync::subscribe_repos::{
     SubscribeRepos, SubscribeReposMessage, SubscribeReposStream,
 };
+use jacquard_common::deps::fluent_uri::Uri;
 use jacquard_common::websocket::tungstenite_client::TungsteniteClient;
 use jacquard_common::xrpc::subscription::SubscriptionExt;
 use tokio::sync::broadcast;
-use url::Url;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -27,7 +27,7 @@ async fn main() -> anyhow::Result<()> {
 
     println!("Connecting to firehose: {}", firehose_url);
 
-    let url = Url::parse(&firehose_url)?;
+    let url = Uri::parse(firehose_url.as_str())?.to_owned();
     let ws_client = TungsteniteClient::new();
     let params = SubscribeRepos::new().build();
 
@@ -40,7 +40,7 @@ async fn main() -> anyhow::Result<()> {
     let (_sink, mut stream) = subscription.into_stream();
 
     // Also test broadcast fanout
-    let (tx, mut rx1) = broadcast::channel::<Arc<SubscribeReposMessage<'static>>>(4096);
+    let (tx, mut rx1) = broadcast::channel::<Arc<SubscribeReposMessage>>(4096);
     let mut rx2 = tx.subscribe();
 
     let mut total = 0u64;
@@ -66,7 +66,7 @@ async fn main() -> anyhow::Result<()> {
                             SubscribeReposMessage::Commit(commit) => {
                                 commits += 1;
                                 for op in &commit.ops {
-                                    let path = op.path.as_ref();
+                                    let path: &str = op.path.as_ref();
                                     if let Some(col) = path.split('/').next() {
                                         *collections.entry(col.to_string()).or_insert(0) += 1;
                                     }
@@ -102,19 +102,19 @@ async fn main() -> anyhow::Result<()> {
         }
 
         // Drain broadcast receivers
-        while let Ok(_) = rx1.try_recv() {
+        while rx1.try_recv().is_ok() {
             consumer1_count += 1;
         }
-        while let Ok(_) = rx2.try_recv() {
+        while rx2.try_recv().is_ok() {
             consumer2_count += 1;
         }
     }
 
     // Final drain
-    while let Ok(_) = rx1.try_recv() {
+    while rx1.try_recv().is_ok() {
         consumer1_count += 1;
     }
-    while let Ok(_) = rx2.try_recv() {
+    while rx2.try_recv().is_ok() {
         consumer2_count += 1;
     }
 

@@ -21,6 +21,21 @@ use tracing::{debug, error, info};
 use models::BlueskyEvent;
 use subscriptions::ActivitySubscriptionManager;
 
+const RELEVANT_COLLECTIONS: &[&str] = &[
+    "app.bsky.feed.post",
+    "app.bsky.feed.like",
+    "app.bsky.graph.follow",
+    "app.bsky.feed.repost",
+];
+
+fn is_relevant_path(path: &str) -> bool {
+    matches!(
+        path.split_once('/'),
+        Some((collection, record_key))
+            if !record_key.is_empty() && RELEVANT_COLLECTIONS.contains(&collection)
+    )
+}
+
 /// Firehose consumer that classifies push-relevant events and enqueues candidate
 /// notifications for Nest to deliver.
 pub struct PushConsumer {
@@ -119,22 +134,15 @@ impl Consumer for PushConsumer {
         metrics::CONSUMER_DROPPED_EVENTS.inc_by(dropped_events as f64);
     }
 
-    async fn handle_event(&self, event: Arc<SubscribeReposMessage<'static>>) -> Result<()> {
+    async fn handle_event(&self, event: Arc<SubscribeReposMessage>) -> Result<()> {
         let commit = match event.as_ref() {
             SubscribeReposMessage::Commit(commit) => commit,
             _ => return Ok(()),
         };
 
-        const RELEVANT_COLLECTIONS: &[&str] = &[
-            "app.bsky.feed.post",
-            "app.bsky.feed.like",
-            "app.bsky.graph.follow",
-            "app.bsky.feed.repost",
-        ];
-
         let has_relevant_ops = commit.ops.iter().any(|op| {
-            let path = op.path.as_ref();
-            RELEVANT_COLLECTIONS.iter().any(|col| path.starts_with(col))
+            let path: &str = op.path.as_ref();
+            is_relevant_path(path)
         });
 
         if !has_relevant_ops {
@@ -148,21 +156,19 @@ impl Consumer for PushConsumer {
         let repo_did = commit.repo.to_string();
 
         for op in &commit.ops {
-            let action = op.action.as_ref();
+            let action: &str = op.action.as_ref();
             if action != "create" && action != "update" {
                 continue;
             }
 
-            let path = op.path.as_ref();
-            let parts: Vec<&str> = path.split('/').collect();
-            if parts.len() < 2 {
+            let path: &str = op.path.as_ref();
+            if !is_relevant_path(path) {
                 continue;
             }
 
-            let collection = parts[0];
-            if !RELEVANT_COLLECTIONS.contains(&collection) {
+            let Some((collection, _)) = path.split_once('/') else {
                 continue;
-            }
+            };
 
             let cid_link = match &op.cid {
                 Some(cid_link) => cid_link,
@@ -181,7 +187,10 @@ impl Consumer for PushConsumer {
             match car_store.read_block_into(cid, &mut record_block).await {
                 Ok(()) => {}
                 Err(err) => {
-                    debug!("Record block not found for CID: {}, error: {}", cid_link, err);
+                    debug!(
+                        "Record block not found for CID: {}, error: {}",
+                        cid_link, err
+                    );
                     continue;
                 }
             }
@@ -219,5 +228,32 @@ impl Consumer for PushConsumer {
         }
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_relevant_path;
+
+    #[test]
+    fn commit_path_filter_requires_an_exact_collection_segment() {
+        for path in [
+            "app.bsky.feed.post/record",
+            "app.bsky.feed.like/record",
+            "app.bsky.graph.follow/record",
+            "app.bsky.feed.repost/record",
+        ] {
+            assert!(is_relevant_path(path), "expected relevant path: {path}");
+        }
+
+        for path in [
+            "app.bsky.feed.post",
+            "app.bsky.feed.postscript/record",
+            "app.bsky.feed.post/",
+            "/app.bsky.feed.post/record",
+            "app.bsky.actor.profile/record",
+        ] {
+            assert!(!is_relevant_path(path), "expected irrelevant path: {path}");
+        }
     }
 }

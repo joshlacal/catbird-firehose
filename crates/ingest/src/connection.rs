@@ -3,6 +3,7 @@ use std::time::Duration;
 
 use anyhow::{anyhow, Result};
 use futures::StreamExt;
+use jacquard_common::deps::fluent_uri::Uri;
 use jacquard_common::stream::StreamError;
 use jacquard_common::websocket::tungstenite_client::TungsteniteClient;
 use jacquard_common::xrpc::subscription::SubscriptionExt;
@@ -22,11 +23,11 @@ const MAX_RECONNECTS: u32 = 10;
 const HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// Run the firehose ingest loop. Connects to the ATProto firehose via jacquard,
-/// parses messages into typed `SubscribeReposMessage<'static>`, and broadcasts
+/// parses messages into owned `SubscribeReposMessage`, and broadcasts
 /// them to all consumers via the provided `broadcast::Sender`.
 pub async fn run_firehose_ingest(
     firehose_url: String,
-    dispatcher: broadcast::Sender<Arc<SubscribeReposMessage<'static>>>,
+    dispatcher: broadcast::Sender<Arc<SubscribeReposMessage>>,
     db_pool: Pool<Postgres>,
     mut shutdown: watch::Receiver<bool>,
 ) -> Result<()> {
@@ -154,21 +155,95 @@ pub async fn run_firehose_ingest(
     Ok(())
 }
 
-fn parse_ws_url(url_str: &str) -> Result<Url> {
+fn parse_ws_url(url_str: &str) -> Result<Uri<String>> {
+    if let Some((_, authority_and_path)) = url_str.split_once("://") {
+        if authority_and_path.is_empty() || authority_and_path.starts_with('/') {
+            return Err(anyhow!("Invalid firehose URL: missing authority"));
+        }
+    }
+
     // Ensure we have a WebSocket scheme
     let ws_url = if url_str.starts_with("https://") {
         url_str.replacen("https://", "wss://", 1)
     } else if url_str.starts_with("http://") {
         url_str.replacen("http://", "ws://", 1)
-    } else if !url_str.starts_with("wss://") && !url_str.starts_with("ws://") {
-        format!("wss://{}", url_str)
-    } else {
+    } else if url_str.starts_with("wss://") || url_str.starts_with("ws://") {
         url_str.to_string()
+    } else if url_str.contains("://") {
+        return Err(anyhow!("Invalid firehose URL: unsupported scheme"));
+    } else {
+        format!("wss://{}", url_str)
     };
 
-    Url::parse(&ws_url).map_err(|e| anyhow!("Invalid firehose URL: {}", e))
+    let parsed = Url::parse(&ws_url).map_err(|e| anyhow!("Invalid firehose URL: {}", e))?;
+
+    if parsed.host_str().is_none() {
+        return Err(anyhow!("Invalid firehose URL: missing authority"));
+    }
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        return Err(anyhow!("Invalid firehose URL: userinfo is not allowed"));
+    }
+    if parsed.query().is_some() {
+        return Err(anyhow!("Invalid firehose URL: query is not allowed"));
+    }
+    if parsed.fragment().is_some() {
+        return Err(anyhow!("Invalid firehose URL: fragment is not allowed"));
+    }
+
+    Uri::parse(parsed.as_str())
+        .map(|uri| uri.to_owned())
+        .map_err(|e| anyhow!("Invalid firehose URI: {}", e))
 }
 
 fn is_closed_error(e: &StreamError) -> bool {
     e.to_string().contains("closed")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_ws_url;
+
+    #[test]
+    fn normalizes_supported_firehose_url_forms() {
+        let cases = [
+            ("https://bsky.network", "wss://bsky.network/"),
+            ("http://127.0.0.1:8080", "ws://127.0.0.1:8080/"),
+            ("http://relay.example", "ws://relay.example/"),
+            ("wss://bsky.network", "wss://bsky.network/"),
+            ("ws://localhost:8080", "ws://localhost:8080/"),
+            ("bsky.network", "wss://bsky.network/"),
+            ("localhost:8080", "wss://localhost:8080/"),
+        ];
+
+        for (input, expected) in cases {
+            let uri = parse_ws_url(input)
+                .unwrap_or_else(|error| panic!("expected {input:?} to be valid, got {error}"));
+            assert_eq!(uri.as_str(), expected, "input: {input}");
+        }
+    }
+
+    #[test]
+    fn rejects_ambiguous_or_non_authority_firehose_urls_without_panicking() {
+        let invalid = [
+            "",
+            "://bad",
+            "ftp://bsky.network",
+            "ws:///missing-host",
+            "wss:missing-authority",
+            "wss://bsky.network:not-a-port",
+            "wss://user@bsky.network",
+            "wss://user:password@bsky.network",
+            "wss://bsky.network?cursor=1",
+            "wss://bsky.network#fragment",
+        ];
+
+        for input in invalid {
+            let result = std::panic::catch_unwind(|| parse_ws_url(input));
+            assert!(result.is_ok(), "parse_ws_url panicked for {input:?}");
+            assert!(
+                result.expect("checked above").is_err(),
+                "expected {input:?} to be rejected"
+            );
+        }
+    }
 }
