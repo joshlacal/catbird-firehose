@@ -1,0 +1,16 @@
+[package]
+name = "catbird-firehose-ingest"
+version = "0.1.0"
+edition.workspace = true
+
+[dependencies]
+jacquard = { workspace = true }
+jacquard-common = { workspace = true }
+jacquard-api = { workspace = true }
+sqlx = { workspace = true }
+tokio = { workspace = true }
+futures = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+bytes = { workspace = true }
+url = { workspace = true }

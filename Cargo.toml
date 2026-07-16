@@ -1,0 +1,100 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/ingest",
+    "crates/fanout",
+    "crates/consumer-push",
+]
+
+[workspace.package]
+edition = "2021"
+license = "MIT"
+
+[workspace.dependencies]
+# Workspace crates
+catbird-firehose-ingest = { path = "crates/ingest" }
+catbird-firehose-fanout = { path = "crates/fanout" }
+catbird-firehose-consumer-push = { path = "crates/consumer-push" }
+
+# AT Protocol (jacquard)
+jacquard = { version = "0.9", default-features = false, features = ["api_full", "streaming", "dns", "cache"] }
+jacquard-common = { version = "0.9", features = ["reqwest-client", "websocket"] }
+jacquard-api = { version = "0.9", features = ["bluesky", "streaming"] }
+jacquard-identity = { version = "0.9", features = ["dns", "cache"] }
+
+# AT Protocol (atrium - kept for CAR parsing)
+atrium-repo = "0.1.5"
+ipld-core = { version = "0.4.2", default-features = false, features = ["std"] }
+serde_ipld_dagcbor = { version = "0.6.2", default-features = false, features = ["std"] }
+
+# Async runtime
+tokio = { version = "1.44", features = ["full"] }
+futures = "0.3"
+
+# Database
+sqlx = { version = "0.8", features = ["runtime-tokio", "tls-rustls", "postgres", "time", "uuid"] }
+
+# HTTP
+axum = "0.7"
+tower-http = { version = "0.5", features = ["cors", "limit"] }
+tower = { version = "0.5", features = ["limit"] }
+reqwest = { version = "0.12", features = ["json"] }
+
+# Push notifications
+a2 = "0.10"
+
+# Caching
+moka = { version = "0.11", features = ["future"] }
+
+# Serialization
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+# Error handling
+anyhow = "1.0"
+thiserror = "2.0"
+
+# Logging / metrics
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+prometheus = "0.13"
+lazy_static = "1.4"
+
+# Crypto / security
+sha2 = "0.10"
+base64 = "0.22"
+rand = "0.8"
+constant_time_eq = "0.2"
+ciborium = "0.2"
+
+# Misc
+dotenv = "0.15"
+chrono = "0.4"
+uuid = { version = "1.16", features = ["v4", "serde"] }
+time = { version = "0.3", features = ["serde-human-readable"] }
+num_cpus = "1.16"
+circuit_breaker = "0.1.1"
+bytes = "1.10"
+url = "2.5"
+
+[package]
+name = "catbird-firehose"
+version = "0.1.0"
+edition.workspace = true
+
+[dependencies]
+catbird-firehose-ingest = { workspace = true }
+catbird-firehose-fanout = { workspace = true }
+catbird-firehose-consumer-push = { workspace = true }
+tokio = { workspace = true }
+sqlx = { workspace = true }
+axum = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+anyhow = { workspace = true }
+dotenv = { workspace = true }
+num_cpus = { workspace = true }
+jacquard-api = { workspace = true }
+jacquard-common = { workspace = true }
+futures = { workspace = true }
+url = { workspace = true }

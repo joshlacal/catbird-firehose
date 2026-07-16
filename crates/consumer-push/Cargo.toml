@@ -1,0 +1,38 @@
+[package]
+name = "catbird-firehose-consumer-push"
+version = "0.1.0"
+edition.workspace = true
+
+[dependencies]
+catbird-firehose-fanout = { workspace = true }
+
+jacquard-api = { workspace = true }
+
+# CAR parsing
+atrium-repo = { workspace = true }
+serde_ipld_dagcbor = { workspace = true }
+
+# Async
+tokio = { workspace = true }
+
+# Database
+sqlx = { workspace = true }
+
+# Caching
+moka = { workspace = true }
+
+# Serialization
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+# Error handling
+anyhow = { workspace = true }
+
+# Logging / metrics
+tracing = { workspace = true }
+prometheus = { workspace = true }
+lazy_static = { workspace = true }
+
+# Misc
+chrono = { workspace = true }
+num_cpus = { workspace = true }

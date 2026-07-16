@@ -1,0 +1,10 @@
+[package]
+name = "catbird-firehose-fanout"
+version = "0.1.0"
+edition.workspace = true
+
+[dependencies]
+jacquard-api = { workspace = true }
+tokio = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
