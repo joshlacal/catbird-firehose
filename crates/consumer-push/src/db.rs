@@ -29,13 +29,34 @@ pub async fn init_db_pool(database_url: &str) -> Result<Pool<Postgres>> {
     Ok(pool)
 }
 
+/// Recipients Nest can actually deliver a push to.
+///
+/// A device row alone is not enough. `push_preferences.account_did` is a
+/// foreign key onto `push_accounts`, so a recipient without an account row
+/// fails preference-building identically on every attempt and can never be
+/// delivered; Nest drops those events outright. Nest likewise purges events for
+/// revoked accounts and only sends to `is_active` devices. Enqueuing for any of
+/// those three shapes produces events that are guaranteed to be thrown away, so
+/// eligibility here mirrors Nest's delivery predicate exactly.
+///
+/// Measured on production 2026-08-11: of 153 DIDs the device-only query
+/// returned, 100 had no account row, 4 had no active device and 15 were
+/// revoked, leaving 34 genuinely deliverable.
 pub async fn get_registered_users(pool: &Pool<Postgres>) -> Result<Vec<String>> {
-    let users = sqlx::query_as::<_, (String,)>("SELECT DISTINCT did FROM user_devices")
-        .fetch_all(pool)
-        .await?
-        .into_iter()
-        .map(|(did,)| did)
-        .collect();
+    let users = sqlx::query_as::<_, (String,)>(
+        r#"
+        SELECT DISTINCT d.did
+        FROM user_devices d
+        JOIN push_accounts a ON a.account_did = d.did
+        WHERE d.is_active
+          AND a.auth_revoked_at IS NULL
+        "#,
+    )
+    .fetch_all(pool)
+    .await?
+    .into_iter()
+    .map(|(did,)| did)
+    .collect();
 
     Ok(users)
 }
