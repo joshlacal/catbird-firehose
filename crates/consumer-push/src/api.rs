@@ -1274,6 +1274,14 @@ async fn register_device(
         }
     };
 
+    if let Err(e) = crate::lock::acquire_account_and_device_lock(&mut tx, &req.did, &req.device_token).await {
+        let _ = tx.rollback().await;
+        tracing::error!("Error acquiring advisory lock: {}", e);
+        return error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Lock error: {}", e),
+        );
+    }
     let existing_registration = match sqlx::query_as::<_, UserDevice>(
         r#"
         SELECT id, did, device_token, created_at, updated_at,
@@ -1805,6 +1813,14 @@ async fn unregister_device(
         }
     };
 
+    if let Err(e) = crate::lock::acquire_account_and_device_lock(&mut tx, &req.did, &req.device_token).await {
+        let _ = tx.rollback().await;
+        tracing::error!("Error acquiring advisory lock: {}", e);
+        return error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Lock error: {}", e),
+        );
+    }
     let device_result = sqlx::query_as::<_, UserDevice>(
         r#"
         SELECT id, did, device_token, created_at, updated_at,

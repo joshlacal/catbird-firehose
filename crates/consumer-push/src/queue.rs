@@ -46,6 +46,7 @@ fn build_candidate(
     event: &BlueskyEvent,
     recipient_did: &str,
     notification_type: NotificationType,
+    auth_generation: i64,
 ) -> PushCandidateEvent {
     PushCandidateEvent {
         recipient_did: recipient_did.to_string(),
@@ -57,6 +58,7 @@ fn build_candidate(
         thread_root_uri: thread_root_uri(event),
         event_record: event.record.clone(),
         event_timestamp: event.timestamp,
+        auth_generation,
     }
 }
 
@@ -71,7 +73,22 @@ async fn enqueue_candidate_set(
             continue;
         }
 
-        let candidate = build_candidate(event, &recipient_did, notification_type.clone());
+        let auth_gen: Option<i64> = sqlx::query_scalar(
+            "SELECT auth_generation FROM push_accounts WHERE account_did = $1 AND auth_revoked_at IS NULL",
+        )
+        .bind(&recipient_did)
+        .fetch_optional(db_pool)
+        .await?;
+
+        let Some(gen) = auth_gen else {
+            continue;
+        };
+
+        if gen <= 0 {
+            continue;
+        }
+
+        let candidate = build_candidate(event, &recipient_did, notification_type.clone(), gen);
         match db::enqueue_push_candidate(db_pool, &candidate).await {
             Ok(true) => metrics::PUSH_QUEUE_ENQUEUED.inc(),
             Ok(false) => metrics::PUSH_QUEUE_DEDUPED.inc(),

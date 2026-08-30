@@ -923,6 +923,8 @@ impl ThreadMuteManager {
 
     /// Mute a thread for a user
     pub async fn mute_thread(&self, user_did: &str, thread_root_uri: &str) -> Result<()> {
+        let mut tx = self.db_pool.begin().await?;
+        crate::lock::acquire_account_lock(&mut tx, user_did).await?;
         sqlx::query(
             r#"
             INSERT INTO thread_mutes (user_did, thread_root_uri)
@@ -932,9 +934,10 @@ impl ThreadMuteManager {
         )
         .bind(user_did)
         .bind(thread_root_uri)
-        .execute(&self.db_pool)
+        .execute(&mut *tx)
         .await
         .context("Failed to insert thread mute")?;
+        tx.commit().await?;
 
         self.thread_mutes_cache.invalidate(user_did).await;
 
@@ -944,6 +947,8 @@ impl ThreadMuteManager {
 
     /// Unmute a thread for a user
     pub async fn unmute_thread(&self, user_did: &str, thread_root_uri: &str) -> Result<()> {
+        let mut tx = self.db_pool.begin().await?;
+        crate::lock::acquire_account_lock(&mut tx, user_did).await?;
         sqlx::query(
             r#"
             DELETE FROM thread_mutes
@@ -952,9 +957,10 @@ impl ThreadMuteManager {
         )
         .bind(user_did)
         .bind(thread_root_uri)
-        .execute(&self.db_pool)
+        .execute(&mut *tx)
         .await
         .context("Failed to delete thread mute")?;
+        tx.commit().await?;
 
         self.thread_mutes_cache.invalidate(user_did).await;
 

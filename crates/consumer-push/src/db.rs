@@ -98,6 +98,8 @@ pub async fn upsert_activity_subscription(
     include_posts: bool,
     include_replies: bool,
 ) -> Result<()> {
+    let mut tx = pool.begin().await?;
+    crate::lock::acquire_account_lock(&mut tx, subscriber_did).await?;
     sqlx::query(
         r#"
         INSERT INTO activity_subscriptions (subscriber_did, subject_did, include_posts, include_replies)
@@ -113,8 +115,9 @@ pub async fn upsert_activity_subscription(
     .bind(subject_did)
     .bind(include_posts)
     .bind(include_replies)
-    .execute(pool)
+    .execute(&mut *tx)
     .await?;
+    tx.commit().await?;
 
     Ok(())
 }
@@ -124,6 +127,8 @@ pub async fn delete_activity_subscription(
     subscriber_did: &str,
     subject_did: &str,
 ) -> Result<()> {
+    let mut tx = pool.begin().await?;
+    crate::lock::acquire_account_lock(&mut tx, subscriber_did).await?;
     sqlx::query(
         r#"
         DELETE FROM activity_subscriptions
@@ -132,8 +137,9 @@ pub async fn delete_activity_subscription(
     )
     .bind(subscriber_did)
     .bind(subject_did)
-    .execute(pool)
+    .execute(&mut *tx)
     .await?;
+    tx.commit().await?;
 
     Ok(())
 }
@@ -142,6 +148,32 @@ pub async fn enqueue_push_candidate(
     pool: &Pool<Postgres>,
     candidate: &PushCandidateEvent,
 ) -> Result<bool> {
+    if candidate.auth_generation <= 0 {
+        return Err(anyhow::anyhow!(
+            "Cannot enqueue candidate with non-positive auth_generation: {}",
+            candidate.auth_generation
+        ));
+    }
+    let mut tx = pool.begin().await?;
+    crate::lock::acquire_account_lock(&mut tx, &candidate.recipient_did).await?;
+
+    let current_gen: Option<i64> = sqlx::query_scalar(
+        "SELECT auth_generation FROM push_accounts WHERE account_did = $1 AND auth_revoked_at IS NULL"
+    )
+    .bind(&candidate.recipient_did)
+    .fetch_optional(&mut *tx)
+    .await?;
+
+    let Some(active_gen) = current_gen else {
+        tx.commit().await?;
+        return Ok(false);
+    };
+
+    if active_gen <= 0 || candidate.auth_generation != active_gen {
+        tx.commit().await?;
+        return Ok(false);
+    }
+
     let record_json = serde_json::to_string(&candidate.event_record)?;
 
     let result = sqlx::query(
@@ -156,9 +188,10 @@ pub async fn enqueue_push_candidate(
             thread_root_uri,
             event_record_json,
             event_timestamp,
-            dedupe_key
+            dedupe_key,
+            auth_generation
         )
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8::jsonb, $9, $10)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8::jsonb, $9, $10, $11)
         ON CONFLICT (dedupe_key) DO NOTHING
         "#,
     )
@@ -172,8 +205,10 @@ pub async fn enqueue_push_candidate(
     .bind(record_json)
     .bind(candidate.event_timestamp)
     .bind(candidate.dedupe_key())
-    .execute(pool)
+    .bind(candidate.auth_generation)
+    .execute(&mut *tx)
     .await?;
 
+    tx.commit().await?;
     Ok(result.rows_affected() > 0)
 }

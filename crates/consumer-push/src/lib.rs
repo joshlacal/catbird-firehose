@@ -1,5 +1,6 @@
 pub mod classifier;
 pub mod db;
+pub mod lock;
 pub mod metrics;
 pub mod models;
 pub mod queue;

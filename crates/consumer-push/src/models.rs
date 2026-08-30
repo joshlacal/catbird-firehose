@@ -85,6 +85,7 @@ pub struct PushCandidateEvent {
     pub thread_root_uri: Option<String>,
     pub event_record: serde_json::Value,
     pub event_timestamp: i64,
+    pub auth_generation: i64,
 }
 
 impl PushCandidateEvent {
