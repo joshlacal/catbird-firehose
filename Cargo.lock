@@ -585,12 +585,14 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "bytes",
+ "ciborium",
  "futures",
  "jacquard",
  "jacquard-api",
  "jacquard-common",
  "sqlx",
  "tokio",
+ "tokio-tungstenite",
  "tracing",
  "url",
 ]

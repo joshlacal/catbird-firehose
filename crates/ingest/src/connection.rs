@@ -4,7 +4,7 @@ use std::time::Duration;
 use anyhow::{anyhow, Result};
 use futures::StreamExt;
 use jacquard_common::deps::fluent_uri::Uri;
-use jacquard_common::stream::StreamError;
+use jacquard_common::stream::{StreamError, StreamErrorKind};
 use jacquard_common::websocket::tungstenite_client::TungsteniteClient;
 use jacquard_common::xrpc::subscription::SubscriptionExt;
 use sqlx::{Pool, Postgres};
@@ -35,16 +35,17 @@ pub async fn run_firehose_ingest(
 
     let mut reconnect_delay = 1u64;
     let mut reconnect_attempts = 0u32;
+    // The persisted cursor is only a periodic checkpoint. Reading it again on
+    // each reconnect replays events already dispatched since that checkpoint.
+    let mut last_cursor = match cursor::get_last_cursor(&db_pool).await {
+        Ok(c) => c,
+        Err(e) => {
+            error!("Failed to get last cursor: {}", e);
+            None
+        }
+    };
 
     'outer: loop {
-        let last_cursor = match cursor::get_last_cursor(&db_pool).await {
-            Ok(c) => c,
-            Err(e) => {
-                error!("Failed to get last cursor: {}", e);
-                None
-            }
-        };
-
         info!("Connecting to firehose, cursor: {:?}", last_cursor);
 
         let base_url = parse_ws_url(&firehose_url)?;
@@ -99,22 +100,26 @@ pub async fn run_firehose_ingest(
 
                     match item {
                         Some(Ok(message)) => {
-                            // Update cursor for commits
-                            if let SubscribeReposMessage::Commit(ref commit) = message {
+                            let sequence = if let SubscribeReposMessage::Commit(ref commit) = message {
                                 if commit.seq % 5000 == 0 {
                                     info!("Firehose seq: {}", commit.seq);
                                 }
-                                if commit.seq % 100 == 0 {
-                                    if let Err(e) = cursor::update_cursor(&db_pool, commit.seq).await {
-                                        error!("Failed to update cursor: {}", e);
-                                    }
-                                }
-                            }
+                                Some(commit.seq)
+                            } else {
+                                None
+                            };
 
                             // Broadcast to all consumers
                             let event = Arc::new(message);
                             if dispatcher.send(event).is_err() {
                                 debug!("No active consumers for broadcast");
+                            } else if let Some(seq) = sequence {
+                                last_cursor = Some(seq);
+                                if seq % 100 == 0 {
+                                    if let Err(e) = cursor::update_cursor(&db_pool, seq).await {
+                                        error!("Failed to update cursor: {}", e);
+                                    }
+                                }
                             }
 
                             // Reset reconnect state on success
@@ -122,6 +127,13 @@ pub async fn run_firehose_ingest(
                             reconnect_delay = 1;
                         }
                         Some(Err(e)) => {
+                            if matches!(e.kind(), StreamErrorKind::Decode) {
+                                // Jacquard has consumed this individual WebSocket
+                                // frame. The connection remains usable; reconnecting
+                                // here replays the preceding valid events forever.
+                                warn!(cursor = ?last_cursor, "Skipping malformed firehose frame: {}", e);
+                                continue 'inner;
+                            }
                             if is_closed_error(&e) {
                                 warn!("Firehose stream closed, reconnecting...");
                             } else {
@@ -148,7 +160,28 @@ pub async fn run_firehose_ingest(
             }
         }
 
-        warn!("Connection interrupted, attempting to reconnect");
+        // A successful handshake followed by an immediate close is also a
+        // failed connection. Apply the same limits as connection failures.
+        reconnect_attempts += 1;
+        if reconnect_attempts >= MAX_RECONNECTS {
+            return Err(anyhow!("Max reconnection attempts reached"));
+        }
+        let delay = Duration::from_secs(reconnect_delay);
+        reconnect_delay = std::cmp::min(reconnect_delay * 2, 60);
+        warn!(
+            "Connection interrupted, retrying in {}s (attempt {}/{})",
+            delay.as_secs(),
+            reconnect_attempts,
+            MAX_RECONNECTS
+        );
+        let should_stop = tokio::select! {
+            _ = tokio::time::sleep(delay) => false,
+            changed = shutdown.changed() => changed.is_ok() && *shutdown.borrow(),
+        };
+        if should_stop {
+            info!("Shutdown signal received while reconnecting");
+            break 'outer;
+        }
     }
 
     info!("Firehose ingest stopped");
@@ -196,7 +229,7 @@ fn parse_ws_url(url_str: &str) -> Result<Uri<String>> {
 }
 
 fn is_closed_error(e: &StreamError) -> bool {
-    e.to_string().contains("closed")
+    matches!(e.kind(), StreamErrorKind::Closed)
 }
 
 #[cfg(test)]
