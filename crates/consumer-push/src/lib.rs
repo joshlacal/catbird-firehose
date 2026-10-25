@@ -1,3 +1,4 @@
+mod car;
 pub mod classifier;
 pub mod db;
 pub mod metrics;
@@ -6,11 +7,9 @@ pub mod queue;
 pub mod subscriptions;
 
 use std::collections::HashSet;
-use std::io::Cursor;
 use std::sync::Arc;
 
 use anyhow::{anyhow, Result};
-use atrium_repo::blockstore::{AsyncBlockStoreRead, CarStore};
 use catbird_firehose_fanout::Consumer;
 use jacquard_api::com_atproto::sync::subscribe_repos::SubscribeReposMessage;
 use sqlx::{Pool, Postgres};
@@ -119,7 +118,7 @@ impl Consumer for PushConsumer {
         metrics::CONSUMER_DROPPED_EVENTS.inc_by(dropped_events as f64);
     }
 
-    async fn handle_event(&self, event: Arc<SubscribeReposMessage<'static>>) -> Result<()> {
+    async fn handle_event(&self, event: Arc<SubscribeReposMessage>) -> Result<()> {
         let commit = match event.as_ref() {
             SubscribeReposMessage::Commit(commit) => commit,
             _ => return Ok(()),
@@ -133,7 +132,7 @@ impl Consumer for PushConsumer {
         ];
 
         let has_relevant_ops = commit.ops.iter().any(|op| {
-            let path = op.path.as_ref();
+            let path: &str = op.path.as_ref();
             RELEVANT_COLLECTIONS.iter().any(|col| path.starts_with(col))
         });
 
@@ -141,19 +140,17 @@ impl Consumer for PushConsumer {
             return Ok(());
         }
 
-        let mut car_store = CarStore::open(Cursor::new(&commit.blocks[..]))
-            .await
-            .map_err(|err| anyhow!("Failed to open CarStore: {}", err))?;
+        let car_blocks = car::validated_blocks(&commit.blocks).await?;
 
         let repo_did = commit.repo.to_string();
 
         for op in &commit.ops {
-            let action = op.action.as_ref();
+            let action: &str = op.action.as_ref();
             if action != "create" && action != "update" {
                 continue;
             }
 
-            let path = op.path.as_ref();
+            let path: &str = op.path.as_ref();
             let parts: Vec<&str> = path.split('/').collect();
             if parts.len() < 2 {
                 continue;
@@ -177,16 +174,12 @@ impl Consumer for PushConsumer {
                 }
             };
 
-            let mut record_block = Vec::new();
-            match car_store.read_block_into(cid, &mut record_block).await {
-                Ok(()) => {}
-                Err(err) => {
-                    debug!("Record block not found for CID: {}, error: {}", cid_link, err);
-                    continue;
-                }
-            }
+            let Some(record_block) = car_blocks.get(&cid) else {
+                debug!("Record block not found for CID: {}", cid_link);
+                continue;
+            };
 
-            let record_data = match Self::deserialize_record(collection, &record_block) {
+            let record_data = match Self::deserialize_record(collection, record_block) {
                 Ok(data) => data,
                 Err(err) => {
                     debug!("Failed to deserialize {}: {}", collection, err);

@@ -11,7 +11,7 @@ const BROADCAST_CAPACITY: usize = 65_536;
 /// One ingest task produces events, each consumer gets its own `Receiver`.
 /// `Arc` wrapper avoids cloning event payloads on broadcast.
 pub struct Dispatcher {
-    sender: broadcast::Sender<Arc<SubscribeReposMessage<'static>>>,
+    sender: broadcast::Sender<Arc<SubscribeReposMessage>>,
 }
 
 impl Dispatcher {
@@ -21,12 +21,12 @@ impl Dispatcher {
     }
 
     /// Get the broadcast sender (for the ingest task).
-    pub fn sender(&self) -> broadcast::Sender<Arc<SubscribeReposMessage<'static>>> {
+    pub fn sender(&self) -> broadcast::Sender<Arc<SubscribeReposMessage>> {
         self.sender.clone()
     }
 
     /// Subscribe a new consumer — returns a new `Receiver`.
-    pub fn subscribe(&self) -> broadcast::Receiver<Arc<SubscribeReposMessage<'static>>> {
+    pub fn subscribe(&self) -> broadcast::Receiver<Arc<SubscribeReposMessage>> {
         self.sender.subscribe()
     }
 }

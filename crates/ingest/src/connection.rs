@@ -3,6 +3,7 @@ use std::time::Duration;
 
 use anyhow::{anyhow, Result};
 use futures::StreamExt;
+use jacquard_common::deps::fluent_uri::Uri;
 use jacquard_common::stream::StreamError;
 use jacquard_common::websocket::tungstenite_client::TungsteniteClient;
 use jacquard_common::xrpc::subscription::SubscriptionExt;
@@ -22,11 +23,11 @@ const MAX_RECONNECTS: u32 = 10;
 const HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// Run the firehose ingest loop. Connects to the ATProto firehose via jacquard,
-/// parses messages into typed `SubscribeReposMessage<'static>`, and broadcasts
+/// parses messages into typed `SubscribeReposMessage`, and broadcasts
 /// them to all consumers via the provided `broadcast::Sender`.
 pub async fn run_firehose_ingest(
     firehose_url: String,
-    dispatcher: broadcast::Sender<Arc<SubscribeReposMessage<'static>>>,
+    dispatcher: broadcast::Sender<Arc<SubscribeReposMessage>>,
     db_pool: Pool<Postgres>,
     mut shutdown: watch::Receiver<bool>,
 ) -> Result<()> {
@@ -46,7 +47,8 @@ pub async fn run_firehose_ingest(
 
         info!("Connecting to firehose, cursor: {:?}", last_cursor);
 
-        let base_url = parse_ws_url(&firehose_url)?;
+        let base_url = Uri::parse(parse_ws_url(&firehose_url)?.to_string())
+            .map_err(|(error, _)| anyhow!("Invalid firehose URI: {error}"))?;
         let ws_client = TungsteniteClient::new();
 
         let params = SubscribeRepos::new().cursor(last_cursor).build();

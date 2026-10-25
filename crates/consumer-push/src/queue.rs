@@ -10,7 +10,10 @@ use crate::{
     subscriptions::ActivitySubscriptionManager,
 };
 
-fn canonical_subject_uri(event: &BlueskyEvent, notification_type: &NotificationType) -> Option<String> {
+fn canonical_subject_uri(
+    event: &BlueskyEvent,
+    notification_type: &NotificationType,
+) -> Option<String> {
     match notification_type {
         NotificationType::Like
         | NotificationType::Repost
@@ -34,7 +37,8 @@ fn canonical_subject_uri(event: &BlueskyEvent, notification_type: &NotificationT
 }
 
 fn thread_root_uri(event: &BlueskyEvent) -> Option<String> {
-    event.record
+    event
+        .record
         .get("reply")
         .and_then(|reply| reply.get("root"))
         .and_then(|root| root.get("uri"))

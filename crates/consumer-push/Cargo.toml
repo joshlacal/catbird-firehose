@@ -9,7 +9,9 @@ catbird-firehose-fanout = { workspace = true }
 jacquard-api = { workspace = true }
 
 # CAR parsing
-atrium-repo = { workspace = true }
+iroh-car = { workspace = true }
+cid = { workspace = true }
+sha2 = { workspace = true }
 serde_ipld_dagcbor = { workspace = true }
 
 # Async

@@ -19,7 +19,7 @@ pub trait Consumer: Send + Sync + 'static {
     /// Process a single firehose event.
     fn handle_event(
         &self,
-        event: Arc<SubscribeReposMessage<'static>>,
+        event: Arc<SubscribeReposMessage>,
     ) -> impl std::future::Future<Output = Result<()>> + Send;
 }
 
@@ -29,7 +29,7 @@ pub trait Consumer: Send + Sync + 'static {
 /// Returns a `JoinHandle` for the consumer task.
 pub fn spawn_consumer<C: Consumer>(
     consumer: Arc<C>,
-    mut rx: broadcast::Receiver<Arc<SubscribeReposMessage<'static>>>,
+    mut rx: broadcast::Receiver<Arc<SubscribeReposMessage>>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         loop {

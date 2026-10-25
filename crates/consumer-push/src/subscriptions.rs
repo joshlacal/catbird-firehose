@@ -36,7 +36,7 @@ impl ActivitySubscriptionManager {
         &self,
         subscriber_did: &str,
     ) -> Result<Vec<ActivitySubscription>> {
-        if let Some(cached) = self.by_subscriber.get(subscriber_did) {
+        if let Some(cached) = self.by_subscriber.get(subscriber_did).await {
             return Ok(cached);
         }
 
@@ -54,7 +54,7 @@ impl ActivitySubscriptionManager {
         &self,
         subject_did: &str,
     ) -> Result<Vec<ActivitySubscription>> {
-        if let Some(cached) = self.by_subject.get(subject_did) {
+        if let Some(cached) = self.by_subject.get(subject_did).await {
             return Ok(cached);
         }
 

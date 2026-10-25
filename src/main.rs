@@ -68,7 +68,7 @@ fn main() -> Result<()> {
 
     runtime.block_on(async {
         logging::setup_logging();
-        dotenv::dotenv().ok();
+        dotenvy::dotenv().ok();
 
         info!("Starting Catbird Firehose Service");
 
