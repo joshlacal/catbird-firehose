@@ -4,6 +4,7 @@ mod logging;
 use anyhow::Result;
 use catbird_firehose_consumer_push::subscriptions::ActivitySubscriptionManager;
 use catbird_firehose_consumer_push::PushConsumer;
+use catbird_firehose_consumer_witness::WitnessConsumer;
 use catbird_firehose_fanout::{consumer::spawn_consumer, Dispatcher};
 use catbird_firehose_ingest::{connection, cursor};
 use std::sync::Arc;
@@ -96,26 +97,47 @@ fn main() -> Result<()> {
 
         let dispatcher = Dispatcher::new();
         let push_rx = dispatcher.subscribe();
-        let push_handle = spawn_consumer(push_consumer, push_rx);
+        let mut push_handle = Some(spawn_consumer(push_consumer, push_rx));
 
-        let mut ingest_handle = tokio::spawn(connection::run_firehose_ingest(
+        let witness_consumer = Arc::new(WitnessConsumer::new(db_pool.clone()));
+        let witness_rx = dispatcher.subscribe();
+        let mut witness_handle = Some(spawn_consumer(witness_consumer, witness_rx));
+
+        let mut ingest_handle = Some(tokio::spawn(connection::run_firehose_ingest(
             config.bsky_service_url.clone(),
             dispatcher.sender(),
             db_pool.clone(),
             shutdown_rx.clone(),
-        ));
+        )));
 
         tokio::select! {
             _ = signal::ctrl_c() => {
                 info!("Received shutdown signal");
             }
-            result = &mut ingest_handle => {
+            result = async { ingest_handle.as_mut().expect("ingest_handle active").await } => {
+                ingest_handle = None;
                 match result {
                     Ok(Ok(())) => info!("Ingest task exited cleanly"),
                     Ok(Err(err)) => error!("Ingest task failed: {}", err),
                     Err(err) => error!("Ingest task panicked: {}", err),
                 }
                 error!("Critical: Ingest task stopped, initiating shutdown");
+            }
+            result = async { push_handle.as_mut().expect("push_handle active").await } => {
+                push_handle = None;
+                match result {
+                    Ok(()) => info!("Push consumer task exited cleanly"),
+                    Err(err) => error!("Push consumer task panicked: {}", err),
+                }
+                error!("Critical: Push consumer stopped, initiating shutdown");
+            }
+            result = async { witness_handle.as_mut().expect("witness_handle active").await } => {
+                witness_handle = None;
+                match result {
+                    Ok(()) => info!("Witness consumer task exited cleanly"),
+                    Err(err) => error!("Witness consumer task panicked: {}", err),
+                }
+                error!("Critical: Witness consumer stopped, initiating shutdown");
             }
         }
 
@@ -125,8 +147,15 @@ fn main() -> Result<()> {
 
         drop(dispatcher);
 
-        join_task("ingest", ingest_handle).await;
-        join_task("push-consumer", push_handle).await;
+        if let Some(handle) = ingest_handle {
+            join_task("ingest", handle).await;
+        }
+        if let Some(handle) = push_handle {
+            join_task("push-consumer", handle).await;
+        }
+        if let Some(handle) = witness_handle {
+            join_task("witness-consumer", handle).await;
+        }
         join_task("push-user-refresh", push_background_handle).await;
         join_task("cursor-cleanup", cursor_cleanup_handle).await;
 

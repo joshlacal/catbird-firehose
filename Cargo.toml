@@ -4,6 +4,7 @@ members = [
     "crates/ingest",
     "crates/fanout",
     "crates/consumer-push",
+    "crates/consumer-witness",
 ]
 
 [workspace.package]
@@ -15,6 +16,8 @@ license = "MIT"
 catbird-firehose-ingest = { path = "crates/ingest" }
 catbird-firehose-fanout = { path = "crates/fanout" }
 catbird-firehose-consumer-push = { path = "crates/consumer-push" }
+catbird-firehose-consumer-witness = { path = "crates/consumer-witness" }
+catbird-atproto = { path = "/Users/joshlacalamito/Developer/.workspaces/dec1-w0/wave1-catbird-atproto", features = ["namespace-bluecatbird"] }
 
 # AT Protocol (jacquard)
 jacquard = { version = "=0.12.1", default-features = false, features = ["api_full", "streaming", "dns", "cache"] }
@@ -86,6 +89,7 @@ edition.workspace = true
 catbird-firehose-ingest = { workspace = true }
 catbird-firehose-fanout = { workspace = true }
 catbird-firehose-consumer-push = { workspace = true }
+catbird-firehose-consumer-witness = { workspace = true }
 tokio = { workspace = true }
 sqlx = { workspace = true }
 axum = { workspace = true }

@@ -22,10 +22,7 @@ pub fn advisory_lock_key_for_device(token: &str) -> i64 {
 
 /// Acquires a transaction-level advisory lock for an account DID.
 /// The lock is automatically released when the transaction commits or aborts.
-pub async fn acquire_account_lock(
-    tx: &mut Transaction<'_, Postgres>,
-    did: &str,
-) -> Result<()> {
+pub async fn acquire_account_lock(tx: &mut Transaction<'_, Postgres>, did: &str) -> Result<()> {
     let key = advisory_lock_key_for_account(did);
     sqlx::query("SELECT pg_advisory_xact_lock($1)")
         .bind(key)
@@ -76,6 +73,9 @@ mod tests {
         let test_str = "shared_identity_string";
         let acc_k = advisory_lock_key_for_account(test_str);
         let dev_k = advisory_lock_key_for_device(test_str);
-        assert_ne!(acc_k, dev_k, "Account and device lock keys must be domain separated");
+        assert_ne!(
+            acc_k, dev_k,
+            "Account and device lock keys must be domain separated"
+        );
     }
 }
