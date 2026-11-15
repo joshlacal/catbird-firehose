@@ -17,7 +17,7 @@ catbird-firehose-ingest = { path = "crates/ingest" }
 catbird-firehose-fanout = { path = "crates/fanout" }
 catbird-firehose-consumer-push = { path = "crates/consumer-push" }
 catbird-firehose-consumer-witness = { path = "crates/consumer-witness" }
-catbird-atproto = { path = "/Users/joshlacalamito/Developer/.workspaces/dec1-w0/wave1-catbird-atproto", features = ["namespace-bluecatbird"] }
+catbird-atproto = { path = "../catbird-atproto", features = ["namespace-bluecatbird"] }
 
 # AT Protocol (jacquard)
 jacquard = { version = "=0.12.1", default-features = false, features = ["api_full", "streaming", "dns", "cache"] }
