@@ -606,15 +606,25 @@ name = "catbird-firehose-consumer-witness"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-trait",
  "atrium-repo",
+ "base64 0.22.1",
  "bytes",
  "catbird-atproto",
  "catbird-firehose-fanout",
+ "constant_time_eq",
+ "curve25519-dalek",
+ "ed25519-dalek",
  "ipld-core",
  "jacquard-api",
  "jacquard-common 0.12.1",
+ "k256",
  "lazy_static",
+ "multibase",
+ "p256",
  "prometheus",
+ "rand 0.8.8",
+ "reqwest",
  "serde",
  "serde_ipld_dagcbor 0.6.4",
  "serde_json",
@@ -623,6 +633,7 @@ dependencies = [
  "thiserror 2.0.20",
  "tokio",
  "tracing",
+ "url",
  "uuid",
 ]
 

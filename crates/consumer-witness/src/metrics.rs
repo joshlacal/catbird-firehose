@@ -23,6 +23,27 @@ lazy_static! {
         &["kind"]
     )
     .unwrap();
+    pub static ref WITNESS_COMMIT_SIG_VERIFIED: CounterVec = register_counter_vec!(
+        Opts::new(
+            "firehose_witness_commit_signatures_verified_total",
+            "Total number of transparency firehose commits whose #atproto ECDSA signature verified"
+        ),
+        &["curve"]
+    )
+    .unwrap();
+    pub static ref WITNESS_VERIFICATION_FAILURES: CounterVec = register_counter_vec!(
+        Opts::new(
+            "firehose_witness_verification_failures_total",
+            "Total number of cryptographic or structural verification failures in consumer-witness by reason"
+        ),
+        &["reason"]
+    )
+    .unwrap();
+    pub static ref WITNESS_CONSUMER_EVENT_ERRORS: Counter = register_counter!(Opts::new(
+        "firehose_witness_consumer_event_errors_total",
+        "Total number of errors returned from WitnessConsumer::handle_event"
+    ))
+    .unwrap();
     pub static ref WITNESS_CONSUMER_LAG_EVENTS: Counter = register_counter!(Opts::new(
         "firehose_witness_consumer_lag_events_total",
         "Total number of times the witness consumer lagged behind the firehose"

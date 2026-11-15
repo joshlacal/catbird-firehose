@@ -16,6 +16,9 @@ pub trait Consumer: Send + Sync + 'static {
     /// Observe broadcast lag for this consumer.
     fn handle_lag(&self, _dropped_events: u64) {}
 
+    /// Observe an error returned by `handle_event`.
+    fn handle_error(&self, _error: &anyhow::Error) {}
+
     /// Process a single firehose event.
     fn handle_event(
         &self,
@@ -36,6 +39,7 @@ pub fn spawn_consumer<C: Consumer>(
             match rx.recv().await {
                 Ok(event) => {
                     if let Err(e) = consumer.handle_event(event).await {
+                        consumer.handle_error(&e);
                         error!(consumer = consumer.name(), "Error handling event: {}", e);
                     }
                 }

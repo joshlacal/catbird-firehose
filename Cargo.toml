@@ -69,6 +69,12 @@ base64 = "0.22"
 rand = "0.8"
 constant_time_eq = "0.2"
 ciborium = "0.2"
+p256 = { version = "0.13", default-features = false, features = ["ecdsa"] }
+k256 = { version = "0.13", default-features = false, features = ["ecdsa"] }
+ed25519-dalek = { version = "2.2", default-features = false, features = ["std"] }
+curve25519-dalek = { version = "4.1", default-features = false, features = ["alloc", "digest", "precomputed-tables"] }
+multibase = "0.9"
+async-trait = "0.1"
 
 # Misc
 dotenv = "0.15"

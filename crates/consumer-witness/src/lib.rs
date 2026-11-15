@@ -12,10 +12,20 @@
 
 pub mod db;
 pub mod metrics;
+pub mod verify;
+
+pub use verify::{
+    verify_atproto_v3_commit_signature, verify_mst_key_lookup, AtprotoKeyResolver,
+    AtprotoVerifyingKey, CommitVerifyError, HttpAtprotoKeyResolver, StaticAtprotoKeyResolver,
+    P256_MULTICODEC_PREFIX, SECP256K1_MULTICODEC_PREFIX,
+};
 
 use std::collections::HashMap;
 use std::io::Cursor;
-use std::sync::Arc;
+use std::sync::{
+    atomic::{AtomicU64, Ordering},
+    Arc,
+};
 
 use anyhow::Result;
 use catbird_atproto::generated::blue_catbird::{
@@ -204,23 +214,12 @@ fn parse_device_block(
         return Err("unexpected extra fields in blue.catbird.chat.device".to_string());
     }
     let alg = parsed.algorithm.as_ref();
-    let expected_key_len = match alg {
-        "ed25519" => 32usize,
-        "p256" => 33usize,
-        other => {
-            return Err(format!(
-                "unsupported blue.catbird.chat.device algorithm '{other}'"
-            ));
-        }
-    };
     let pubkey = parsed.mls_signature_public_key.as_ref();
-    if pubkey.len() != expected_key_len
-        && !(alg == "p256" && pubkey.len() == 65 && pubkey[0] == 0x04)
-    {
-        return Err(format!(
-            "invalid {alg} signature public key length {}",
-            pubkey.len()
-        ));
+    if let Err(err) = verify::verify_chat_device_pubkey(alg, pubkey) {
+        metrics::WITNESS_VERIFICATION_FAILURES
+            .with_label_values(&["invalid_chat_device_pubkey"])
+            .inc();
+        return Err(err);
     }
     Ok(WitnessedDeviceRecord {
         rkey: rkey.to_string(),
@@ -234,6 +233,7 @@ fn parse_device_block(
 }
 
 fn parse_mailbox_keys_block(
+    actor_did: &str,
     rkey: &str,
     cid: &str,
     seq: i64,
@@ -283,15 +283,35 @@ fn parse_mailbox_keys_block(
             cur.encryption_pubkey.len()
         ));
     }
-    if cur.self_sig.len() != 64 {
-        return Err(format!(
-            "selfSig must be 64 bytes, got {}",
-            cur.self_sig.len()
-        ));
+    let self_msg = [verify::LABYRINTH_SELF_SIG_PREFIX, cur.epoch_head.as_ref()].concat();
+    if let Err(err) = verify::verify_labyrinth_xeddsa(
+        cur.signing_pubkey.as_ref(),
+        &self_msg,
+        cur.self_sig.as_ref(),
+        "selfSig",
+    ) {
+        metrics::WITNESS_VERIFICATION_FAILURES
+            .with_label_values(&["invalid_mailbox_self_sig"])
+            .inc();
+        return Err(err);
+    }
+    if let Err(err) = verify::verify_labyrinth_ed25519_attestation(
+        actor_did,
+        cur.epoch_head.as_ref(),
+        cur.attestation.transport_pubkey.as_ref(),
+        cur.attestation.sig.as_ref(),
+    ) {
+        metrics::WITNESS_VERIFICATION_FAILURES
+            .with_label_values(&["invalid_mailbox_attestation_sig"])
+            .inc();
+        return Err(err);
     }
     if let Some(prev_sig) = cur.prev_sig.as_ref() {
-        if prev_sig.len() != 64 {
-            return Err(format!("prevSig must be 64 bytes, got {}", prev_sig.len()));
+        if let Err(err) = verify::check_xeddsa_sig_canonical(prev_sig.as_ref(), "prevSig") {
+            metrics::WITNESS_VERIFICATION_FAILURES
+                .with_label_values(&["invalid_mailbox_prev_sig"])
+                .inc();
+            return Err(err);
         }
     }
 
@@ -853,24 +873,31 @@ async fn evaluate_mailbox_keys_op<S: WitnessStore>(
         return Ok(());
     };
 
-    let parsed =
-        match parse_mailbox_keys_block(rkey, cid, commit.seq, &commit.rev, !is_self_rkey, block) {
-            Ok(rec) => rec,
-            Err(reason) => {
-                emit_anomaly(
-                    store,
-                    commit,
-                    &op.action,
-                    &op.path,
-                    Some(cid.to_string()),
-                    WitnessAnomalyKind::MalformedTransparencyRecord,
-                    reason,
-                    outcome,
-                )
-                .await?;
-                return Ok(());
-            }
-        };
+    let parsed = match parse_mailbox_keys_block(
+        &commit.actor_did,
+        rkey,
+        cid,
+        commit.seq,
+        &commit.rev,
+        !is_self_rkey,
+        block,
+    ) {
+        Ok(rec) => rec,
+        Err(reason) => {
+            emit_anomaly(
+                store,
+                commit,
+                &op.action,
+                &op.path,
+                Some(cid.to_string()),
+                WitnessAnomalyKind::MalformedTransparencyRecord,
+                reason,
+                outcome,
+            )
+            .await?;
+            return Ok(());
+        }
+    };
 
     if let Some(expected_epoch) = expected_immutable_epoch {
         if parsed.epoch_number != expected_epoch {
@@ -973,7 +1000,7 @@ async fn evaluate_mailbox_keys_op<S: WitnessStore>(
         }
     }
 
-    // Cross-check backward link `epoch - 1` if known.
+    // Cross-check backward link `epoch - 1` if known (both hash link and XEdDSA prevSig).
     if parsed.epoch_number > 0 {
         if let Some(prev_epoch_num) = parsed.epoch_number.checked_sub(1) {
             if let Some(prior_epoch) = store
@@ -991,6 +1018,37 @@ async fn evaluate_mailbox_keys_op<S: WitnessStore>(
                         WitnessAnomalyKind::MailboxBrokenHashChain,
                         format!(
                             "epoch {} previousEpochHead does not match witnessed epoch {} head",
+                            parsed.epoch_number, prev_epoch_num
+                        ),
+                        outcome,
+                    )
+                    .await?;
+                    return Ok(());
+                }
+                let prev_sig_bytes = parsed.prev_sig.as_deref().unwrap_or_default();
+                let prev_msg = [
+                    verify::LABYRINTH_PREV_SIG_PREFIX,
+                    parsed.epoch_head.as_slice(),
+                ]
+                .concat();
+                if let Err(err) = verify::verify_labyrinth_xeddsa(
+                    &prior_epoch.signing_pubkey,
+                    &prev_msg,
+                    prev_sig_bytes,
+                    "prevSig",
+                ) {
+                    metrics::WITNESS_VERIFICATION_FAILURES
+                        .with_label_values(&["invalid_mailbox_prev_sig"])
+                        .inc();
+                    emit_anomaly(
+                        store,
+                        commit,
+                        &op.action,
+                        &op.path,
+                        Some(cid.to_string()),
+                        WitnessAnomalyKind::MailboxBrokenHashChain,
+                        format!(
+                            "epoch {} prevSig failed XEdDSA verification under epoch {} signingPubkey: {err}",
                             parsed.epoch_number, prev_epoch_num
                         ),
                         outcome,
@@ -1018,6 +1076,37 @@ async fn evaluate_mailbox_keys_op<S: WitnessStore>(
                     WitnessAnomalyKind::MailboxBrokenHashChain,
                     format!(
                         "epoch {} epochHead does not match witnessed epoch {} previousEpochHead",
+                        parsed.epoch_number, next_epoch_num
+                    ),
+                    outcome,
+                )
+                .await?;
+                return Ok(());
+            }
+            let next_prev_sig = next_epoch.prev_sig.as_deref().unwrap_or_default();
+            let next_prev_msg = [
+                verify::LABYRINTH_PREV_SIG_PREFIX,
+                next_epoch.epoch_head.as_slice(),
+            ]
+            .concat();
+            if let Err(err) = verify::verify_labyrinth_xeddsa(
+                &parsed.signing_pubkey,
+                &next_prev_msg,
+                next_prev_sig,
+                "nextEpoch.prevSig",
+            ) {
+                metrics::WITNESS_VERIFICATION_FAILURES
+                    .with_label_values(&["invalid_mailbox_prev_sig"])
+                    .inc();
+                emit_anomaly(
+                    store,
+                    commit,
+                    &op.action,
+                    &op.path,
+                    Some(cid.to_string()),
+                    WitnessAnomalyKind::MailboxBrokenHashChain,
+                    format!(
+                        "epoch {} signingPubkey failed XEdDSA verification of witnessed epoch {} prevSig: {err}",
                         parsed.epoch_number, next_epoch_num
                     ),
                     outcome,
@@ -1125,15 +1214,32 @@ async fn evaluate_mailbox_keys_op<S: WitnessStore>(
     Ok(())
 }
 
-/// Firehose `Consumer` that indexes and witnesses `blue.catbird.chat.device` and
-/// `blue.catbird.labyrinth.mailboxKeys` commit operations in PostgreSQL.
+/// Firehose `Consumer` that cryptographically verifies ATProto v3 commits + MST proofs and
+/// witnesses `blue.catbird.chat.device` and `blue.catbird.labyrinth.mailboxKeys` operations.
 pub struct WitnessConsumer {
     db_pool: Pool<Postgres>,
+    key_resolver: Arc<dyn AtprotoKeyResolver>,
+    verification_failures: AtomicU64,
 }
 
 impl WitnessConsumer {
     pub fn new(db_pool: Pool<Postgres>) -> Self {
-        Self { db_pool }
+        Self::with_key_resolver(db_pool, Arc::new(HttpAtprotoKeyResolver::new()))
+    }
+
+    pub fn with_key_resolver(
+        db_pool: Pool<Postgres>,
+        key_resolver: Arc<dyn AtprotoKeyResolver>,
+    ) -> Self {
+        Self {
+            db_pool,
+            key_resolver,
+            verification_failures: AtomicU64::new(0),
+        }
+    }
+
+    pub fn verification_failures_count(&self) -> u64 {
+        self.verification_failures.load(Ordering::Relaxed)
     }
 
     pub async fn ingest_observed_commit(&self, commit: &ObservedCommit) -> Result<WitnessOutcome> {
@@ -1146,6 +1252,157 @@ impl WitnessConsumer {
         tx.commit().await?;
         metrics::WITNESS_COMMITS_PROCESSED.inc();
         Ok(outcome)
+    }
+
+    /// Authenticate the CARv1 archive, `#atproto` v3 ECDSA commit signature (`P-256` or
+    /// `secp256k1`, compact 64-byte low-S), and MST inclusion/exclusion proofs for every
+    /// transparency op in `commit` before any witness state is mutated.
+    pub async fn verify_and_extract_observed_commit(
+        &self,
+        commit: &jacquard_api::com_atproto::sync::subscribe_repos::Commit,
+    ) -> std::result::Result<ObservedCommit, CommitVerifyError> {
+        if commit.blocks.is_empty() {
+            return Err(CommitVerifyError::EmptyCar);
+        }
+
+        let commit_cid = commit
+            .commit
+            .to_ipld()
+            .map_err(|e| CommitVerifyError::InvalidCommitCid(e.to_string()))?;
+        if !is_valid_dag_cbor_sha256_cid_v1(&commit_cid) {
+            return Err(CommitVerifyError::InvalidCommitCid(format!(
+                "commit CID {commit_cid} is not CIDv1(dag-cbor, sha2-256)"
+            )));
+        }
+
+        let (roots, car_blocks) =
+            parse_bounded_car_v1(&commit.blocks).map_err(CommitVerifyError::InvalidCar)?;
+        if roots.as_slice() != [commit_cid] {
+            return Err(CommitVerifyError::CommitRootMismatch(format!(
+                "CAR header roots {roots:?} do not match frame commit CID {commit_cid}"
+            )));
+        }
+
+        let commit_block = car_blocks
+            .get(&commit_cid)
+            .copied()
+            .ok_or_else(|| CommitVerifyError::MissingCommitBlock(commit_cid.to_string()))?;
+
+        let actor_did: &str = commit.repo.as_ref();
+        let rev_str: &str = commit.rev.as_ref();
+
+        let mut key = self
+            .key_resolver
+            .resolve_atproto_key(actor_did, false)
+            .await
+            .map_err(CommitVerifyError::DidResolution)?;
+
+        let mst_root_cid = match verify::verify_atproto_v3_commit_signature(
+            commit_block,
+            actor_did,
+            rev_str,
+            &key,
+        ) {
+            Ok(root) => root,
+            Err(CommitVerifyError::InvalidSignature) => {
+                // Key rotation resilience: force-refresh DID document once on signature failure.
+                key = self
+                    .key_resolver
+                    .resolve_atproto_key(actor_did, true)
+                    .await
+                    .map_err(CommitVerifyError::DidResolution)?;
+                verify::verify_atproto_v3_commit_signature(commit_block, actor_did, rev_str, &key)?
+            }
+            Err(other) => return Err(other),
+        };
+
+        let mut ops = Vec::with_capacity(commit.ops.len());
+        for op in &commit.ops {
+            let path: &str = op.path.as_ref();
+            if !is_transparency_path(path) {
+                continue;
+            }
+            let action: &str = op.action.as_ref();
+            match action {
+                "create" | "update" => {
+                    let cid_link = op.cid.as_ref().ok_or_else(|| {
+                        CommitVerifyError::InvalidOpCid(format!(
+                            "{action} op on {path} missing required CID"
+                        ))
+                    })?;
+                    let op_cid = cid_link
+                        .to_ipld()
+                        .map_err(|e| CommitVerifyError::InvalidOpCid(e.to_string()))?;
+                    if !is_valid_dag_cbor_sha256_cid_v1(&op_cid) {
+                        return Err(CommitVerifyError::InvalidOpCid(format!(
+                            "op CID {op_cid} on {path} is not CIDv1(dag-cbor, sha2-256)"
+                        )));
+                    }
+                    let mst_val =
+                        verify::verify_mst_key_lookup(&car_blocks, mst_root_cid, path.as_bytes())
+                            .map_err(CommitVerifyError::MstProofFailed)?;
+                    if mst_val != Some(op_cid) {
+                        return Err(CommitVerifyError::MstProofFailed(format!(
+                            "MST lookup for {path} resolved to {mst_val:?}, expected Some({op_cid})"
+                        )));
+                    }
+                    let raw_block = car_blocks.get(&op_cid).copied().ok_or_else(|| {
+                        CommitVerifyError::MissingOrOversizedRecordBlock(format!(
+                            "missing CAR block {op_cid} for {path}"
+                        ))
+                    })?;
+                    if raw_block.len() > MAX_WITNESS_RECORD_BLOCK_BYTES {
+                        return Err(CommitVerifyError::MissingOrOversizedRecordBlock(format!(
+                            "record block {op_cid} for {path} exceeds {MAX_WITNESS_RECORD_BLOCK_BYTES} bytes"
+                        )));
+                    }
+                    ops.push(ObservedRepoOp {
+                        action: action.to_string(),
+                        path: path.to_string(),
+                        cid: Some(op_cid.to_string()),
+                        block: Some(raw_block.to_vec()),
+                    });
+                }
+                "delete" => {
+                    if op.cid.is_some() {
+                        return Err(CommitVerifyError::InvalidOpCid(format!(
+                            "delete op on {path} must not carry a CID"
+                        )));
+                    }
+                    let mst_val =
+                        verify::verify_mst_key_lookup(&car_blocks, mst_root_cid, path.as_bytes())
+                            .map_err(CommitVerifyError::MstProofFailed)?;
+                    if mst_val.is_some() {
+                        return Err(CommitVerifyError::MstProofFailed(format!(
+                            "delete op on {path} contradicted by MST inclusion {mst_val:?}"
+                        )));
+                    }
+                    ops.push(ObservedRepoOp {
+                        action: action.to_string(),
+                        path: path.to_string(),
+                        cid: None,
+                        block: None,
+                    });
+                }
+                other => {
+                    return Err(CommitVerifyError::MstProofFailed(format!(
+                        "unsupported repo op action '{other}' on {path}"
+                    )));
+                }
+            }
+        }
+
+        metrics::WITNESS_COMMIT_SIG_VERIFIED
+            .with_label_values(&[key.curve_label()])
+            .inc();
+
+        Ok(ObservedCommit {
+            actor_did: actor_did.to_string(),
+            seq: commit.seq,
+            rev: rev_str.to_string(),
+            commit_cid: commit_cid.to_string(),
+            ops,
+        })
     }
 }
 
@@ -1176,13 +1433,15 @@ fn is_valid_dag_cbor_sha256_cid_v1(cid: &Cid) -> bool {
         && cid.hash().digest().len() == SHA2_256_DIGEST_LEN
 }
 
-/// Bounded, panic-free in-slice CARv1 block reader for untrusted firehose `#commit.blocks`.
+type ParsedCarV1<'a> = (Vec<Cid>, HashMap<Cid, &'a [u8]>);
+
+/// Bounded, panic-free in-slice CARv1 reader for untrusted firehose `#commit.blocks`.
 ///
 /// Validates header and section lengths against remaining slice bounds before slicing or
-/// decoding, uses `checked_sub` for `section_len` vs `cid_len`, caps section count, and
-/// requires `CIDv1` + `dag-cbor` (`0x71`) + `sha2-256` (`0x12`) with verified `SHA256(block)`
-/// on every block.
-fn parse_bounded_car_v1_blocks(car_bytes: &[u8]) -> Result<HashMap<Cid, &[u8]>, String> {
+/// decoding, enforces canonical DAG-CBOR on header, uses `checked_sub` for `section_len`
+/// vs `cid_len`, caps section count, rejects duplicate CIDs, and requires `CIDv1` +
+/// `dag-cbor` (`0x71`) + `sha2-256` (`0x12`) with verified `SHA256(block)` on every block.
+fn parse_bounded_car_v1(car_bytes: &[u8]) -> Result<ParsedCarV1<'_>, String> {
     if car_bytes.is_empty() {
         return Err("empty CAR archive".to_string());
     }
@@ -1206,20 +1465,30 @@ fn parse_bounded_car_v1_blocks(car_bytes: &[u8]) -> Result<HashMap<Cid, &[u8]>, 
     let hdr_slice = car_bytes
         .get(hdr_varint_len..hdr_end)
         .ok_or_else(|| "CAR header exceeds archive bounds".to_string())?;
+    verify::verify_canonical_dagcbor(hdr_slice)
+        .map_err(|e| format!("non-canonical CARv1 header DAG-CBOR: {e}"))?;
 
     let hdr_ipld: Ipld = serde_ipld_dagcbor::from_slice(hdr_slice)
         .map_err(|e| format!("invalid CARv1 DAG-CBOR header: {e}"))?;
     let Ipld::Map(hdr_map) = hdr_ipld else {
         return Err("CAR header must be a DAG-CBOR map".to_string());
     };
-    if hdr_map.get("version") != Some(&Ipld::Integer(1)) {
-        return Err("CAR header version must equal 1".to_string());
+    if hdr_map.len() != 2 || hdr_map.get("version") != Some(&Ipld::Integer(1)) {
+        return Err("CAR header must contain version=1 and roots".to_string());
     }
-    match hdr_map.get("roots") {
-        Some(Ipld::List(roots))
-            if roots.len() <= 64 && roots.iter().all(|r| matches!(r, Ipld::Link(_))) => {}
+    let roots = match hdr_map.get("roots") {
+        Some(Ipld::List(list)) if list.len() <= 64 => {
+            let mut cids = Vec::with_capacity(list.len());
+            for item in list {
+                let Ipld::Link(cid) = item else {
+                    return Err("CAR header roots entries must be CID links".to_string());
+                };
+                cids.push(*cid);
+            }
+            cids
+        }
         _ => return Err("CAR header must contain 0..=64 CID roots".to_string()),
-    }
+    };
 
     let mut blocks = HashMap::new();
     let mut pos = hdr_end;
@@ -1258,6 +1527,9 @@ fn parse_bounded_car_v1_blocks(car_bytes: &[u8]) -> Result<HashMap<Cid, &[u8]>, 
             Cid::read_bytes(&mut cursor).map_err(|e| format!("invalid CAR section CID: {e}"))?;
         let cid_len = usize::try_from(cursor.position())
             .map_err(|_| "CAR CID offset overflow".to_string())?;
+        if cid.to_bytes().as_slice() != &section[..cid_len] {
+            return Err("non-canonical CID encoding in CAR section".to_string());
+        }
         let data_len = section
             .len()
             .checked_sub(cid_len)
@@ -1282,10 +1554,17 @@ fn parse_bounded_car_v1_blocks(car_bytes: &[u8]) -> Result<HashMap<Cid, &[u8]>, 
             return Err(format!("CAR block SHA-256 digest mismatch for CID {cid}"));
         }
 
-        blocks.insert(cid, block);
+        if blocks.insert(cid, block).is_some() {
+            return Err(format!("duplicate CID {cid} in CAR archive"));
+        }
     }
 
-    Ok(blocks)
+    Ok((roots, blocks))
+}
+
+#[cfg(test)]
+fn parse_bounded_car_v1_blocks(car_bytes: &[u8]) -> Result<HashMap<Cid, &[u8]>, String> {
+    parse_bounded_car_v1(car_bytes).map(|(_roots, blocks)| blocks)
 }
 
 impl Consumer for WitnessConsumer {
@@ -1296,6 +1575,10 @@ impl Consumer for WitnessConsumer {
     fn handle_lag(&self, dropped_events: u64) {
         metrics::WITNESS_CONSUMER_LAG_EVENTS.inc();
         metrics::WITNESS_CONSUMER_DROPPED_EVENTS.inc_by(dropped_events as f64);
+    }
+
+    fn handle_error(&self, _error: &anyhow::Error) {
+        metrics::WITNESS_CONSUMER_EVENT_ERRORS.inc();
     }
 
     async fn handle_event(&self, event: Arc<SubscribeReposMessage>) -> Result<()> {
@@ -1311,68 +1594,23 @@ impl Consumer for WitnessConsumer {
             return Ok(());
         }
 
-        let car_blocks = if commit.blocks.is_empty() {
-            None
-        } else {
-            match parse_bounded_car_v1_blocks(&commit.blocks) {
-                Ok(blocks) => Some(blocks),
-                Err(err) => {
-                    warn!(
-                        actor_did = %commit.repo,
-                        seq = commit.seq,
-                        rev = %commit.rev,
-                        error = %err,
-                        "Invalid or corrupt CAR blocks on transparency commit; evaluating ops as missing-block anomalies"
-                    );
-                    None
-                }
+        let observed = match self.verify_and_extract_observed_commit(commit).await {
+            Ok(obs) => obs,
+            Err(err) => {
+                self.verification_failures.fetch_add(1, Ordering::Relaxed);
+                metrics::WITNESS_VERIFICATION_FAILURES
+                    .with_label_values(&[err.metric_reason()])
+                    .inc();
+                warn!(
+                    actor_did = %commit.repo,
+                    seq = commit.seq,
+                    rev = %commit.rev,
+                    reason = err.metric_reason(),
+                    error = %err,
+                    "Rejected firehose transparency commit failing cryptographic/Merkle verification"
+                );
+                return Err(anyhow::Error::new(err));
             }
-        };
-
-        let mut ops = Vec::with_capacity(commit.ops.len());
-        for op in &commit.ops {
-            let path: &str = op.path.as_ref();
-            if !is_transparency_path(path) {
-                continue;
-            }
-            let action: &str = op.action.as_ref();
-            let mut cid_str = None;
-            let mut block_bytes = None;
-
-            if let Some(cid_link) = &op.cid {
-                match cid_link.to_ipld() {
-                    Ok(cid) => {
-                        cid_str = Some(cid.to_string());
-                        if is_valid_dag_cbor_sha256_cid_v1(&cid) {
-                            if let Some(raw_block) =
-                                car_blocks.as_ref().and_then(|m| m.get(&cid).copied())
-                            {
-                                if raw_block.len() <= MAX_WITNESS_RECORD_BLOCK_BYTES {
-                                    block_bytes = Some(raw_block.to_vec());
-                                }
-                            }
-                        }
-                    }
-                    Err(_) => {
-                        cid_str = Some(format!("{cid_link:?}"));
-                    }
-                }
-            }
-
-            ops.push(ObservedRepoOp {
-                action: action.to_string(),
-                path: path.to_string(),
-                cid: cid_str,
-                block: block_bytes,
-            });
-        }
-
-        let observed = ObservedCommit {
-            actor_did: commit.repo.to_string(),
-            seq: commit.seq,
-            rev: commit.rev.as_ref().to_string(),
-            commit_cid: format!("{}", commit.commit),
-            ops,
         };
 
         self.ingest_observed_commit(&observed).await?;
@@ -1389,47 +1627,160 @@ mod tests {
     use catbird_atproto::jacquard_common::{
         deps::bytes::Bytes as JqBytes, types::string::Datetime,
     };
+    use std::collections::BTreeMap;
 
-    fn encode_device_cbor(alg: &str, key_byte: u8, key_len: usize) -> Vec<u8> {
+    fn encode_device_cbor(alg: &str, seed_byte: u8, _key_len: usize) -> Vec<u8> {
         let dt: Datetime = "2026-11-13T12:00:00Z".parse().expect("valid RFC3339");
+        let pubkey_bytes = match alg {
+            "ed25519" => {
+                let sk = ed25519_dalek::SigningKey::from_bytes(&[seed_byte; 32]);
+                sk.verifying_key().to_bytes().to_vec()
+            }
+            "p256" => {
+                let mut scalar_seed = [seed_byte.max(1); 32];
+                scalar_seed[0] = seed_byte.wrapping_add(1).max(1);
+                let sk = p256::ecdsa::SigningKey::from_bytes((&scalar_seed).into())
+                    .expect("valid P-256 test scalar");
+                sk.verifying_key()
+                    .to_encoded_point(true)
+                    .as_bytes()
+                    .to_vec()
+            }
+            _ => vec![seed_byte; 32],
+        };
         let dev: Device = Device {
             algorithm: alg.into(),
             created_at: dt,
-            mls_signature_public_key: JqBytes::from(vec![key_byte; key_len]),
+            mls_signature_public_key: JqBytes::from(pubkey_bytes),
             extra_data: None,
         };
         serde_ipld_dagcbor::to_vec(&dev).expect("encode Device DAG-CBOR")
     }
 
+    fn test_epoch_signing_secret(actor_did: &str, epoch_number: i64) -> [u8; 32] {
+        Sha256::digest(format!(
+            "test-labyrinth-epoch-sig:{actor_did}:{epoch_number}"
+        ))
+        .into()
+    }
+
     fn encode_mailbox_cbor(
+        actor_did: &str,
         epoch_number: i64,
         head_byte: u8,
         prev_head_byte: Option<u8>,
     ) -> Vec<u8> {
+        use ed25519_dalek::Signer as _;
+
         let dt: Datetime = "2026-11-13T12:00:00Z".parse().expect("valid RFC3339");
+        let epoch_head = [head_byte; 32];
+        let sig_secret = test_epoch_signing_secret(actor_did, epoch_number);
+        let signing_pubkey = verify::xeddsa_public_from_secret(&sig_secret);
+        let self_msg = [verify::LABYRINTH_SELF_SIG_PREFIX, epoch_head.as_slice()].concat();
+        let self_sig = verify::xeddsa_sign_deterministic(&sig_secret, &self_msg, &[0x42; 64]);
+
+        let prev_sig = prev_head_byte.map(|_| {
+            let prev_secret = test_epoch_signing_secret(actor_did, epoch_number.saturating_sub(1));
+            let prev_msg = [verify::LABYRINTH_PREV_SIG_PREFIX, epoch_head.as_slice()].concat();
+            JqBytes::from(
+                verify::xeddsa_sign_deterministic(&prev_secret, &prev_msg, &[0x43; 64]).to_vec(),
+            )
+        });
+
+        let transport_seed: [u8; 32] =
+            Sha256::digest(format!("test-labyrinth-transport:{actor_did}")).into();
+        let transport_sk = ed25519_dalek::SigningKey::from_bytes(&transport_seed);
+        let mut attest_msg =
+            format!("{}{actor_did}:", verify::LABYRINTH_ATTEST_PREFIX).into_bytes();
+        attest_msg.extend_from_slice(&epoch_head);
+        let attest_sig = transport_sk.sign(&attest_msg);
+
         let mk: MailboxKeys = MailboxKeys {
             backend: Some(MailboxKeysBackend::Space),
             current: EpochPublic {
                 attestation: TransportAttestation {
-                    sig: JqBytes::from(vec![0xAA; 64]),
-                    transport_pubkey: JqBytes::from(vec![0xBB; 32]),
+                    sig: JqBytes::from(attest_sig.to_bytes().to_vec()),
+                    transport_pubkey: JqBytes::from(
+                        transport_sk.verifying_key().to_bytes().to_vec(),
+                    ),
                     extra_data: None,
                 },
                 auth_pubkey: JqBytes::from(vec![0x11; 32]),
                 encryption_pubkey: JqBytes::from(vec![0x22; 1216]),
-                epoch_head: JqBytes::from(vec![head_byte; 32]),
+                epoch_head: JqBytes::from(epoch_head.to_vec()),
                 epoch_number,
                 members_hash: JqBytes::from(vec![0x33; 32]),
-                prev_sig: prev_head_byte.map(|_| JqBytes::from(vec![0x44; 64])),
+                prev_sig,
                 previous_epoch_head: prev_head_byte.map(|b| JqBytes::from(vec![b; 32])),
-                self_sig: JqBytes::from(vec![0x55; 64]),
-                signing_pubkey: JqBytes::from(vec![0x66; 32]),
+                self_sig: JqBytes::from(self_sig.to_vec()),
+                signing_pubkey: JqBytes::from(signing_pubkey.to_vec()),
                 extra_data: None,
             },
             updated_at: dt,
             extra_data: None,
         };
         serde_ipld_dagcbor::to_vec(&mk).expect("encode MailboxKeys DAG-CBOR")
+    }
+
+    fn build_subscribe_repos_commit_msg(
+        did: &str,
+        rev: &str,
+        seq: i64,
+        commit_cid: Cid,
+        car_bytes: Vec<u8>,
+        ops: Vec<(&str, &str, Option<Cid>)>,
+    ) -> Arc<SubscribeReposMessage> {
+        use jacquard_common::IntoStatic as _;
+
+        let mut op_list = Vec::with_capacity(ops.len());
+        for (action, path, cid_opt) in ops {
+            let mut op_map = BTreeMap::new();
+            op_map.insert("action".to_string(), Ipld::String(action.to_string()));
+            op_map.insert("path".to_string(), Ipld::String(path.to_string()));
+            if let Some(cid) = cid_opt {
+                op_map.insert("cid".to_string(), Ipld::Link(cid));
+            }
+            op_list.push(Ipld::Map(op_map));
+        }
+
+        let mut commit_map = BTreeMap::new();
+        commit_map.insert("blobs".to_string(), Ipld::List(vec![]));
+        commit_map.insert("blocks".to_string(), Ipld::Bytes(car_bytes));
+        commit_map.insert("commit".to_string(), Ipld::Link(commit_cid));
+        commit_map.insert("ops".to_string(), Ipld::List(op_list));
+        commit_map.insert("rebase".to_string(), Ipld::Bool(false));
+        commit_map.insert("repo".to_string(), Ipld::String(did.to_string()));
+        commit_map.insert("rev".to_string(), Ipld::String(rev.to_string()));
+        commit_map.insert("seq".to_string(), Ipld::Integer(seq as i128));
+        commit_map.insert(
+            "time".to_string(),
+            Ipld::String("2026-11-13T12:05:00Z".to_string()),
+        );
+        commit_map.insert("tooBig".to_string(), Ipld::Bool(false));
+
+        let raw_commit = serde_ipld_dagcbor::to_vec(&Ipld::Map(commit_map)).unwrap();
+        let decoded_commit: jacquard_api::com_atproto::sync::subscribe_repos::Commit =
+            serde_ipld_dagcbor::from_slice(&raw_commit).unwrap();
+        Arc::new(SubscribeReposMessage::Commit(Box::new(
+            decoded_commit.into_static(),
+        )))
+    }
+
+    fn sub_be_32(minuend: &[u8; 32], subtrahend: &[u8; 32]) -> [u8; 32] {
+        let mut out = [0u8; 32];
+        let mut borrow = 0i16;
+        for i in (0..32).rev() {
+            let diff = i16::from(minuend[i]) - i16::from(subtrahend[i]) - borrow;
+            if diff < 0 {
+                out[i] = (diff + 256) as u8;
+                borrow = 1;
+            } else {
+                out[i] = diff as u8;
+                borrow = 0;
+            }
+        }
+        assert_eq!(borrow, 0, "minuend must be >= subtrahend");
+        out
     }
 
     #[tokio::test]
@@ -1455,13 +1806,13 @@ mod tests {
                         action: "create".to_string(),
                         path: "blue.catbird.labyrinth.mailboxKeys/000000000000".to_string(),
                         cid: Some("bafymk0".to_string()),
-                        block: Some(encode_mailbox_cbor(0, 0xA0, None)),
+                        block: Some(encode_mailbox_cbor(alice, 0, 0xA0, None)),
                     },
                     ObservedRepoOp {
                         action: "create".to_string(),
                         path: "blue.catbird.labyrinth.mailboxKeys/self".to_string(),
                         cid: Some("bafymk0".to_string()),
-                        block: Some(encode_mailbox_cbor(0, 0xA0, None)),
+                        block: Some(encode_mailbox_cbor(alice, 0, 0xA0, None)),
                     },
                 ],
             },
@@ -1491,13 +1842,13 @@ mod tests {
                         action: "create".to_string(),
                         path: "blue.catbird.labyrinth.mailboxKeys/000000000001".to_string(),
                         cid: Some("bafymk1".to_string()),
-                        block: Some(encode_mailbox_cbor(1, 0xA1, Some(0xA0))),
+                        block: Some(encode_mailbox_cbor(alice, 1, 0xA1, Some(0xA0))),
                     },
                     ObservedRepoOp {
                         action: "update".to_string(),
                         path: "blue.catbird.labyrinth.mailboxKeys/self".to_string(),
                         cid: Some("bafymk1".to_string()),
-                        block: Some(encode_mailbox_cbor(1, 0xA1, Some(0xA0))),
+                        block: Some(encode_mailbox_cbor(alice, 1, 0xA1, Some(0xA0))),
                     },
                 ],
             },
@@ -1547,7 +1898,7 @@ mod tests {
                         action: "create".to_string(),
                         path: "blue.catbird.labyrinth.mailboxKeys/000000000000".to_string(),
                         cid: Some("bafymk0".to_string()),
-                        block: Some(encode_mailbox_cbor(0, 0xB0, None)),
+                        block: Some(encode_mailbox_cbor(bob, 0, 0xB0, None)),
                     },
                 ],
             },
@@ -1579,7 +1930,7 @@ mod tests {
                         action: "update".to_string(),
                         path: "blue.catbird.labyrinth.mailboxKeys/000000000000".to_string(),
                         cid: Some("bafymk0b".to_string()),
-                        block: Some(encode_mailbox_cbor(0, 0xB9, None)),
+                        block: Some(encode_mailbox_cbor(bob, 0, 0xB9, None)),
                     },
                     ObservedRepoOp {
                         action: "delete".to_string(),
@@ -1623,19 +1974,19 @@ mod tests {
                         action: "create".to_string(),
                         path: "blue.catbird.labyrinth.mailboxKeys/000000000000".to_string(),
                         cid: Some("bafymk0".to_string()),
-                        block: Some(encode_mailbox_cbor(0, 0xC0, None)),
+                        block: Some(encode_mailbox_cbor(carol, 0, 0xC0, None)),
                     },
                     ObservedRepoOp {
                         action: "create".to_string(),
                         path: "blue.catbird.labyrinth.mailboxKeys/000000000001".to_string(),
                         cid: Some("bafymk1".to_string()),
-                        block: Some(encode_mailbox_cbor(1, 0xC1, Some(0xC0))),
+                        block: Some(encode_mailbox_cbor(carol, 1, 0xC1, Some(0xC0))),
                     },
                     ObservedRepoOp {
                         action: "update".to_string(),
                         path: "blue.catbird.labyrinth.mailboxKeys/self".to_string(),
                         cid: Some("bafymk1".to_string()),
-                        block: Some(encode_mailbox_cbor(1, 0xC1, Some(0xC0))),
+                        block: Some(encode_mailbox_cbor(carol, 1, 0xC1, Some(0xC0))),
                     },
                 ],
             },
@@ -1656,19 +2007,19 @@ mod tests {
                         action: "update".to_string(),
                         path: "blue.catbird.labyrinth.mailboxKeys/self".to_string(),
                         cid: Some("bafymk0".to_string()),
-                        block: Some(encode_mailbox_cbor(0, 0xC0, None)),
+                        block: Some(encode_mailbox_cbor(carol, 0, 0xC0, None)),
                     },
                     ObservedRepoOp {
                         action: "update".to_string(),
                         path: "blue.catbird.labyrinth.mailboxKeys/self".to_string(),
                         cid: Some("bafymk1_evil".to_string()),
-                        block: Some(encode_mailbox_cbor(1, 0xEE, Some(0xC0))),
+                        block: Some(encode_mailbox_cbor(carol, 1, 0xEE, Some(0xC0))),
                     },
                     ObservedRepoOp {
                         action: "create".to_string(),
                         path: "blue.catbird.labyrinth.mailboxKeys/000000000002".to_string(),
                         cid: Some("bafymk2_broken".to_string()),
-                        block: Some(encode_mailbox_cbor(2, 0xC2, Some(0xFF))),
+                        block: Some(encode_mailbox_cbor(carol, 2, 0xC2, Some(0xFF))),
                     },
                 ],
             },
@@ -1729,8 +2080,24 @@ mod tests {
             .await
             .expect("apply witness up migration");
 
-        let consumer = WitnessConsumer::new(pool.clone());
         let did = "did:plc:davepgwitness00000000004";
+        let dave_p256_sk = p256::ecdsa::SigningKey::from_bytes((&[0x44u8; 32]).into())
+            .expect("valid P-256 signing key");
+        let resolver = Arc::new(StaticAtprotoKeyResolver::new());
+        resolver.insert(
+            did,
+            AtprotoVerifyingKey::P256(*dave_p256_sk.verifying_key()),
+        );
+
+        let k256_did = "did:plc:evak256witness0000000005";
+        let eva_k256_sk = k256::ecdsa::SigningKey::from_bytes((&[0x55u8; 32]).into())
+            .expect("valid secp256k1 signing key");
+        resolver.insert(
+            k256_did,
+            AtprotoVerifyingKey::Secp256k1(*eva_k256_sk.verifying_key()),
+        );
+
+        let consumer = WitnessConsumer::with_key_resolver(pool.clone(), resolver.clone());
         let ok = consumer
             .ingest_observed_commit(&ObservedCommit {
                 actor_did: did.to_string(),
@@ -1748,13 +2115,13 @@ mod tests {
                         action: "create".to_string(),
                         path: "blue.catbird.labyrinth.mailboxKeys/000000000000".to_string(),
                         cid: Some("bafymk0".to_string()),
-                        block: Some(encode_mailbox_cbor(0, 0xD0, None)),
+                        block: Some(encode_mailbox_cbor(did, 0, 0xD0, None)),
                     },
                     ObservedRepoOp {
                         action: "create".to_string(),
                         path: "blue.catbird.labyrinth.mailboxKeys/self".to_string(),
                         cid: Some("bafymk0".to_string()),
-                        block: Some(encode_mailbox_cbor(0, 0xD0, None)),
+                        block: Some(encode_mailbox_cbor(did, 0, 0xD0, None)),
                     },
                 ],
             })
@@ -1783,113 +2150,101 @@ mod tests {
         assert_eq!(stored.len(), 1);
         assert_eq!(stored[0].0, "chat_device_mutated_or_deleted");
 
-        // Also exercise Consumer::handle_event end-to-end with a real CAR-encoded #commit payload.
+        // Exercise Consumer::handle_event end-to-end with real P-256 AND secp256k1 signed CARv1 + MST commits,
+        // then verify corrupt/forged frames propagate Err and increment failure metrics without poisoning heads.
         {
-            use atrium_repo::blockstore::{AsyncBlockStoreWrite, CarStore, DAG_CBOR, SHA2_256};
-            use ipld_core::ipld::Ipld;
-            use std::collections::BTreeMap;
-
+            // 1) Valid P-256 signed v3 commit + MST proof for `did`.
+            let dev2_path = "blue.catbird.chat.device/3l7devcar2";
             let dev2_bytes = encode_device_cbor("p256", 0x03, 33);
-            let mut car_buf = Cursor::new(Vec::new());
-            let mut car = CarStore::create(&mut car_buf).await.unwrap();
-            let dev2_cid = car
-                .write_block(DAG_CBOR, SHA2_256, &dev2_bytes)
-                .await
-                .unwrap();
-            let root_cid = car
-                .write_block(DAG_CBOR, SHA2_256, b"\xa1dtest\xf5")
-                .await
-                .unwrap();
-            drop(car);
-            let car_bytes = car_buf.into_inner();
-
-            let mut op_map = BTreeMap::new();
-            op_map.insert("action".to_string(), Ipld::String("create".to_string()));
-            op_map.insert(
-                "path".to_string(),
-                Ipld::String("blue.catbird.chat.device/3l7devcar2".to_string()),
+            let dev2_cid = verify::compute_dagcbor_cid(&dev2_bytes);
+            let mut mst_records = BTreeMap::new();
+            mst_records.insert(dev2_path.to_string(), dev2_cid);
+            let mst_bytes = verify::encode_mst_leaf_cbor(&mst_records);
+            let mst_cid = verify::compute_dagcbor_cid(&mst_bytes);
+            let unsigned_commit =
+                verify::encode_unsigned_v3_commit_cbor(did, "3l7dddd222224", mst_cid, None);
+            let sig_p256 = verify::sign_p256_low_s(&dave_p256_sk, &unsigned_commit);
+            let signed_commit =
+                verify::encode_signed_v3_commit_cbor(did, "3l7dddd222224", mst_cid, None, sig_p256);
+            let root_cid = verify::compute_dagcbor_cid(&signed_commit);
+            let car_bytes = verify::encode_car_v1(
+                &[root_cid],
+                &[
+                    (root_cid, signed_commit),
+                    (mst_cid, mst_bytes),
+                    (dev2_cid, dev2_bytes),
+                ],
             );
-            op_map.insert("cid".to_string(), Ipld::Link(dev2_cid));
 
-            let mut commit_map = BTreeMap::new();
-            commit_map.insert("blobs".to_string(), Ipld::List(vec![]));
-            commit_map.insert("blocks".to_string(), Ipld::Bytes(car_bytes));
-            commit_map.insert("commit".to_string(), Ipld::Link(root_cid));
-            commit_map.insert("ops".to_string(), Ipld::List(vec![Ipld::Map(op_map)]));
-            commit_map.insert("rebase".to_string(), Ipld::Bool(false));
-            commit_map.insert("repo".to_string(), Ipld::String(did.to_string()));
-            commit_map.insert("rev".to_string(), Ipld::String("3l7dddd222224".to_string()));
-            commit_map.insert("seq".to_string(), Ipld::Integer(3));
-            commit_map.insert(
-                "time".to_string(),
-                Ipld::String("2026-11-13T12:05:00Z".to_string()),
+            let msg = build_subscribe_repos_commit_msg(
+                did,
+                "3l7dddd222224",
+                3,
+                root_cid,
+                car_bytes,
+                vec![("create", dev2_path, Some(dev2_cid))],
             );
-            commit_map.insert("tooBig".to_string(), Ipld::Bool(false));
-
-            let raw_commit = serde_ipld_dagcbor::to_vec(&Ipld::Map(commit_map)).unwrap();
-            let decoded_commit: jacquard_api::com_atproto::sync::subscribe_repos::Commit =
-                serde_ipld_dagcbor::from_slice(&raw_commit).unwrap();
-            use jacquard_common::IntoStatic as _;
-            let msg = SubscribeReposMessage::Commit(Box::new(decoded_commit.into_static()));
-            consumer.handle_event(Arc::new(msg)).await.unwrap();
+            consumer.handle_event(msg).await.unwrap();
 
             let mut tx = pool.begin().await.unwrap();
             let stored_dev2 = db::fetch_chat_device(&mut tx, did, "3l7devcar2")
                 .await
                 .unwrap()
-                .expect("CAR-ingested chat.device must be persisted");
+                .expect("P-256 signed CAR-ingested chat.device must be persisted");
             assert_eq!(stored_dev2.algorithm, "p256");
             assert_eq!(stored_dev2.first_seen_seq, 3);
             tx.commit().await.unwrap();
 
-            // Corrupt CAR bytes on a transparency commit must still record MalformedTransparencyRecord
-            // instead of dropping the commit on CarStore::open error.
-            let mut corrupt_op = BTreeMap::new();
-            corrupt_op.insert("action".to_string(), Ipld::String("create".to_string()));
-            corrupt_op.insert(
-                "path".to_string(),
-                Ipld::String("blue.catbird.chat.device/3l7devcorrupt".to_string()),
+            // 2) Valid secp256k1 signed v3 commit + MST proof for `k256_did`.
+            let eva_dev_path = "blue.catbird.chat.device/3l7evadev1";
+            let eva_dev_bytes = encode_device_cbor("ed25519", 0x29, 32);
+            let eva_dev_cid = verify::compute_dagcbor_cid(&eva_dev_bytes);
+            let mut eva_mst_map = BTreeMap::new();
+            eva_mst_map.insert(eva_dev_path.to_string(), eva_dev_cid);
+            let eva_mst_bytes = verify::encode_mst_leaf_cbor(&eva_mst_map);
+            let eva_mst_cid = verify::compute_dagcbor_cid(&eva_mst_bytes);
+            let eva_unsigned = verify::encode_unsigned_v3_commit_cbor(
+                k256_did,
+                "3l7eeee222222",
+                eva_mst_cid,
+                Some(root_cid),
             );
-            corrupt_op.insert("cid".to_string(), Ipld::Link(dev2_cid));
-
-            let mut corrupt_commit = BTreeMap::new();
-            corrupt_commit.insert("blobs".to_string(), Ipld::List(vec![]));
-            corrupt_commit.insert(
-                "blocks".to_string(),
-                Ipld::Bytes(b"not-a-valid-car-archive".to_vec()),
+            let sig_k256 = verify::sign_k256_low_s(&eva_k256_sk, &eva_unsigned);
+            let eva_signed = verify::encode_signed_v3_commit_cbor(
+                k256_did,
+                "3l7eeee222222",
+                eva_mst_cid,
+                Some(root_cid),
+                sig_k256,
             );
-            corrupt_commit.insert("commit".to_string(), Ipld::Link(root_cid));
-            corrupt_commit.insert("ops".to_string(), Ipld::List(vec![Ipld::Map(corrupt_op)]));
-            corrupt_commit.insert("rebase".to_string(), Ipld::Bool(false));
-            corrupt_commit.insert("repo".to_string(), Ipld::String(did.to_string()));
-            corrupt_commit.insert("rev".to_string(), Ipld::String("3l7dddd222225".to_string()));
-            corrupt_commit.insert("seq".to_string(), Ipld::Integer(4));
-            corrupt_commit.insert(
-                "time".to_string(),
-                Ipld::String("2026-11-13T12:06:00Z".to_string()),
+            let eva_root_cid = verify::compute_dagcbor_cid(&eva_signed);
+            let eva_car = verify::encode_car_v1(
+                &[eva_root_cid],
+                &[
+                    (eva_root_cid, eva_signed),
+                    (eva_mst_cid, eva_mst_bytes),
+                    (eva_dev_cid, eva_dev_bytes),
+                ],
             );
-            corrupt_commit.insert("tooBig".to_string(), Ipld::Bool(false));
-
-            let raw_corrupt = serde_ipld_dagcbor::to_vec(&Ipld::Map(corrupt_commit)).unwrap();
-            let decoded_corrupt: jacquard_api::com_atproto::sync::subscribe_repos::Commit =
-                serde_ipld_dagcbor::from_slice(&raw_corrupt).unwrap();
-            let corrupt_msg =
-                SubscribeReposMessage::Commit(Box::new(decoded_corrupt.into_static()));
-            consumer.handle_event(Arc::new(corrupt_msg)).await.unwrap();
-
-            let anomalies = db::list_anomalies_for_actor(&pool, did).await.unwrap();
-            assert!(
-                anomalies.iter().any(|(kind, path, _detail)| {
-                    kind == WitnessAnomalyKind::MalformedTransparencyRecord.as_str()
-                        && path == "blue.catbird.chat.device/3l7devcorrupt"
-                }),
-                "corrupt CAR commit must record MalformedTransparencyRecord anomaly"
+            let eva_msg = build_subscribe_repos_commit_msg(
+                k256_did,
+                "3l7eeee222222",
+                4,
+                eva_root_cid,
+                eva_car,
+                vec![("create", eva_dev_path, Some(eva_dev_cid))],
             );
+            consumer.handle_event(eva_msg).await.unwrap();
+            let mut tx = pool.begin().await.unwrap();
+            let stored_eva = db::fetch_chat_device(&mut tx, k256_did, "3l7evadev1")
+                .await
+                .unwrap()
+                .expect("secp256k1 signed CAR-ingested chat.device must be persisted");
+            assert_eq!(stored_eva.algorithm, "ed25519");
+            tx.commit().await.unwrap();
 
-            // Feed adversarial CARv1 payloads directly into `WitnessConsumer::handle_event`:
-            // (a) `data_len < cid_len` (`section_len = 1` followed by 36B CIDv1 -> subtraction underflow trap)
-            // (b) oversized `header_len` varint (~4 GiB header claim in a 16-byte buffer -> OOM trap)
-            // (c) non-SHA256 identity multihash (`0x00`) CID section
+            // 3) Corrupt CAR bytes & adversarial CARv1 payloads MUST return Err, increment
+            //    verification_failures + WITNESS_VERIFICATION_FAILURES, and NOT advance actor_head!
             let valid_hdr_bytes = {
                 let mut h = BTreeMap::new();
                 h.insert("version".to_string(), Ipld::Integer(1));
@@ -1900,14 +2255,11 @@ mod tests {
             let mut underflow_car = Vec::new();
             underflow_car.push(valid_hdr_bytes.len() as u8);
             underflow_car.extend_from_slice(&valid_hdr_bytes);
-            // Section claims `section_len = 1`, followed by 36-byte CIDv1 bytes (`data_len < cid_len`).
             underflow_car.push(1u8);
             underflow_car.extend_from_slice(&dev2_cid.to_bytes());
 
-            // Oversized header varint: `0xFF, 0xFF, 0xFF, 0xFF, 0x0F` (~4 GiB) with only 8 trailing bytes.
             let oversized_hdr_car = vec![0xFF, 0xFF, 0xFF, 0xFF, 0x0F, 0xA1, 0x61, 0x76, 0x01];
 
-            // Identity multihash (`0x00`) CIDv1 section (`0x01` CIDv1, `0x71` dag-cbor, `0x00` identity, len 4, "abcd").
             let mut identity_mh_car = Vec::new();
             identity_mh_car.push(valid_hdr_bytes.len() as u8);
             identity_mh_car.extend_from_slice(&valid_hdr_bytes);
@@ -1917,50 +2269,57 @@ mod tests {
             identity_mh_car.push(fake_cid_and_block.len() as u8);
             identity_mh_car.extend_from_slice(fake_cid_and_block);
 
-            for (idx, (rkey_suffix, rev_str, seq_num, bad_blocks)) in [
-                ("3l7underflow", "3l7dddd222226", 5i64, underflow_car),
-                ("3l7hugehdr", "3l7dddd222227", 6i64, oversized_hdr_car),
-                ("3l7identmh", "3l7dddd222232", 7i64, identity_mh_car),
-            ]
-            .into_iter()
-            .enumerate()
-            {
+            let failures_before = consumer.verification_failures_count();
+            let metric_invalid_car_before = metrics::WITNESS_VERIFICATION_FAILURES
+                .with_label_values(&["invalid_car"])
+                .get();
+
+            for (rkey_suffix, rev_str, seq_num, bad_blocks) in [
+                (
+                    "3l7devcorrupt",
+                    "3l7dddd222225",
+                    5i64,
+                    b"not-a-valid-car-archive".to_vec(),
+                ),
+                ("3l7underflow", "3l7dddd222226", 6i64, underflow_car),
+                ("3l7hugehdr", "3l7dddd222227", 7i64, oversized_hdr_car),
+                ("3l7identmh", "3l7dddd222232", 8i64, identity_mh_car),
+            ] {
                 let op_path = format!("blue.catbird.chat.device/{rkey_suffix}");
-                let mut adv_op = BTreeMap::new();
-                adv_op.insert("action".to_string(), Ipld::String("create".to_string()));
-                adv_op.insert("path".to_string(), Ipld::String(op_path.clone()));
-                adv_op.insert("cid".to_string(), Ipld::Link(dev2_cid));
-
-                let mut adv_commit = BTreeMap::new();
-                adv_commit.insert("blobs".to_string(), Ipld::List(vec![]));
-                adv_commit.insert("blocks".to_string(), Ipld::Bytes(bad_blocks));
-                adv_commit.insert("commit".to_string(), Ipld::Link(root_cid));
-                adv_commit.insert("ops".to_string(), Ipld::List(vec![Ipld::Map(adv_op)]));
-                adv_commit.insert("rebase".to_string(), Ipld::Bool(false));
-                adv_commit.insert("repo".to_string(), Ipld::String(did.to_string()));
-                adv_commit.insert("rev".to_string(), Ipld::String(rev_str.to_string()));
-                adv_commit.insert("seq".to_string(), Ipld::Integer(seq_num as i128));
-                adv_commit.insert(
-                    "time".to_string(),
-                    Ipld::String(format!("2026-11-13T12:0{}:00Z", 7 + idx)),
+                let adv_msg = build_subscribe_repos_commit_msg(
+                    did,
+                    rev_str,
+                    seq_num,
+                    root_cid,
+                    bad_blocks,
+                    vec![("create", &op_path, Some(dev2_cid))],
                 );
-                adv_commit.insert("tooBig".to_string(), Ipld::Bool(false));
-
-                let raw_adv = serde_ipld_dagcbor::to_vec(&Ipld::Map(adv_commit)).unwrap();
-                let decoded_adv: jacquard_api::com_atproto::sync::subscribe_repos::Commit =
-                    serde_ipld_dagcbor::from_slice(&raw_adv).unwrap();
-                let adv_msg = SubscribeReposMessage::Commit(Box::new(decoded_adv.into_static()));
-                consumer.handle_event(Arc::new(adv_msg)).await.unwrap();
-
-                let anomalies = db::list_anomalies_for_actor(&pool, did).await.unwrap();
-                assert!(
-                    anomalies.iter().any(|(kind, path, _)| {
-                        kind == WitnessAnomalyKind::MalformedTransparencyRecord.as_str()
-                            && path == &op_path
-                    }),
-                    "adversarial CAR case {rkey_suffix} must record MalformedTransparencyRecord without panic/OOM"
-                );
+                let err = consumer
+                    .handle_event(adv_msg)
+                    .await
+                    .expect_err("corrupt/adversarial CAR must propagate verification error");
+                consumer.handle_error(&err);
+                assert!(err.downcast_ref::<CommitVerifyError>().is_some());
             }
+
+            assert_eq!(consumer.verification_failures_count(), failures_before + 4);
+            let metric_invalid_car_after = metrics::WITNESS_VERIFICATION_FAILURES
+                .with_label_values(&["invalid_car"])
+                .get();
+            assert!(
+                (metric_invalid_car_after - metric_invalid_car_before) >= 4.0,
+                "WITNESS_VERIFICATION_FAILURES[invalid_car] must increment on every rejected CAR"
+            );
+
+            // Confirm unauthenticated commits did NOT poison `did`'s actor_head in Postgres.
+            let mut tx = pool.begin().await.unwrap();
+            let head = db::fetch_actor_head(&mut tx, did)
+                .await
+                .unwrap()
+                .expect("actor head exists");
+            assert_eq!(head.max_rev, "3l7dddd222224");
+            assert_eq!(head.last_seq, 3);
+            tx.commit().await.unwrap();
         }
 
         let _ = sqlx::query(&format!("DROP SCHEMA IF EXISTS \"{schema}\" CASCADE"))
@@ -1986,7 +2345,7 @@ mod tests {
                     action: "create".to_string(),
                     path: "blue.catbird.labyrinth.mailboxKeys/self".to_string(),
                     cid: Some("bafymkmax".to_string()),
-                    block: Some(encode_mailbox_cbor(i64::MAX, 0xAA, None)),
+                    block: Some(encode_mailbox_cbor(alice, i64::MAX, 0xAA, None)),
                 }],
             },
         )
@@ -2012,7 +2371,7 @@ mod tests {
                     action: "create".to_string(),
                     path: "blue.catbird.labyrinth.mailboxKeys/self".to_string(),
                     cid: Some("bafymk13d".to_string()),
-                    block: Some(encode_mailbox_cbor(1_000_000_000_000, 0xBB, None)),
+                    block: Some(encode_mailbox_cbor(alice, 1_000_000_000_000, 0xBB, None)),
                 }],
             },
         )
@@ -2038,6 +2397,7 @@ mod tests {
                     path: "blue.catbird.labyrinth.mailboxKeys/self".to_string(),
                     cid: Some("bafymkceil".to_string()),
                     block: Some(encode_mailbox_cbor(
+                        alice,
                         MAX_MAILBOX_EPOCH_NUMBER,
                         0xCC,
                         Some(0x11),
@@ -2076,6 +2436,13 @@ mod tests {
         let parsed = parse_bounded_car_v1_blocks(&good_car).expect("valid CARv1");
         assert_eq!(parsed.get(&valid_cid).copied(), Some(block.as_slice()));
 
+        // Duplicate CID block rejected
+        let mut dup_car = good_car.clone();
+        dup_car.push((cid_bytes.len() + block.len()) as u8);
+        dup_car.extend_from_slice(&cid_bytes);
+        dup_car.extend_from_slice(block);
+        assert!(parse_bounded_car_v1_blocks(&dup_car).is_err());
+
         // `data_len < cid_len` (`section_len = 1` + 36B CID)
         let mut underflow_car = Vec::new();
         underflow_car.push(hdr_bytes.len() as u8);
@@ -2101,5 +2468,555 @@ mod tests {
         let last = tampered_car.len() - 1;
         tampered_car[last] ^= 0xFF;
         assert!(parse_bounded_car_v1_blocks(&tampered_car).is_err());
+    }
+
+    #[test]
+    fn verifies_valid_p256_and_secp256k1_signed_commits_and_multikey_did_docs() {
+        use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+
+        let did_p256 = "did:plc:p256commitverify00000001";
+        let did_k256 = "did:plc:k256commitverify00000002";
+        let mst_cid = verify::compute_dagcbor_cid(&verify::encode_mst_leaf_cbor(&BTreeMap::new()));
+        let prev_cid = verify::compute_dagcbor_cid(b"\xa1dprev\xf5");
+
+        // 1) P-256 (`0x1200` / `[0x80, 0x24]` / `zDna...`) Multikey + JWK + signed commit
+        let p256_sk = p256::ecdsa::SigningKey::from_bytes((&[0x21u8; 32]).into()).unwrap();
+        let p256_vk = AtprotoVerifyingKey::P256(*p256_sk.verifying_key());
+        let p256_multikey = p256_vk.to_multikey();
+        assert!(
+            p256_multikey.starts_with("zDna"),
+            "P-256 Multikey must use 0x1200 base58btc prefix zDna..., got {p256_multikey}"
+        );
+        assert_eq!(
+            AtprotoVerifyingKey::from_multikey(&p256_multikey).unwrap(),
+            p256_vk
+        );
+
+        let p256_did_doc = serde_json::json!({
+            "id": did_p256,
+            "verificationMethod": [{
+                "id": format!("{did_p256}#atproto"),
+                "type": "Multikey",
+                "controller": did_p256,
+                "publicKeyMultibase": p256_multikey,
+            }]
+        });
+        let resolved_p256 = AtprotoVerifyingKey::parse_did_document_atproto_key(
+            did_p256,
+            &serde_json::to_vec(&p256_did_doc).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(resolved_p256, p256_vk);
+
+        let unsigned_p256 =
+            verify::encode_unsigned_v3_commit_cbor(did_p256, "3l7p256000001", mst_cid, None);
+        let sig_p256 = verify::sign_p256_low_s(&p256_sk, &unsigned_p256);
+        let signed_p256 = verify::encode_signed_v3_commit_cbor(
+            did_p256,
+            "3l7p256000001",
+            mst_cid,
+            None,
+            sig_p256,
+        );
+        let out_p256 = verify_atproto_v3_commit_signature(
+            &signed_p256,
+            did_p256,
+            "3l7p256000001",
+            &resolved_p256,
+        )
+        .expect("valid P-256 commit signature must verify");
+        assert_eq!(out_p256, mst_cid);
+
+        // 2) secp256k1 (`0xe7` / `[0xe7, 0x01]` / `zQ3s...`) Multikey + JWK + signed commit (with prev link)
+        let k256_sk = k256::ecdsa::SigningKey::from_bytes((&[0x31u8; 32]).into()).unwrap();
+        let k256_vk = AtprotoVerifyingKey::Secp256k1(*k256_sk.verifying_key());
+        let k256_multikey = k256_vk.to_multikey();
+        assert!(
+            k256_multikey.starts_with("zQ3s"),
+            "secp256k1 Multikey must use 0xe7 base58btc prefix zQ3s..., got {k256_multikey}"
+        );
+        assert_eq!(
+            AtprotoVerifyingKey::from_multikey(&k256_multikey).unwrap(),
+            k256_vk
+        );
+
+        let k256_uncompressed = k256_sk.verifying_key().to_encoded_point(false);
+        let k256_jwk_doc = serde_json::json!({
+            "id": did_k256,
+            "verificationMethod": [{
+                "id": "#atproto",
+                "type": "JsonWebKey2020",
+                "controller": did_k256,
+                "publicKeyJwk": {
+                    "kty": "EC",
+                    "crv": "secp256k1",
+                    "x": URL_SAFE_NO_PAD.encode(k256_uncompressed.x().unwrap()),
+                    "y": URL_SAFE_NO_PAD.encode(k256_uncompressed.y().unwrap()),
+                }
+            }]
+        });
+        let resolved_k256 = AtprotoVerifyingKey::parse_did_document_atproto_key(
+            did_k256,
+            &serde_json::to_vec(&k256_jwk_doc).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(resolved_k256, k256_vk);
+
+        let unsigned_k256 = verify::encode_unsigned_v3_commit_cbor(
+            did_k256,
+            "3l7k256000002",
+            mst_cid,
+            Some(prev_cid),
+        );
+        let sig_k256 = verify::sign_k256_low_s(&k256_sk, &unsigned_k256);
+        let signed_k256 = verify::encode_signed_v3_commit_cbor(
+            did_k256,
+            "3l7k256000002",
+            mst_cid,
+            Some(prev_cid),
+            sig_k256,
+        );
+        let out_k256 = verify_atproto_v3_commit_signature(
+            &signed_k256,
+            did_k256,
+            "3l7k256000002",
+            &resolved_k256,
+        )
+        .expect("valid secp256k1 commit signature must verify");
+        assert_eq!(out_k256, mst_cid);
+    }
+
+    #[test]
+    fn rejects_tampered_commit_bytes_wrong_atproto_key_and_spoofed_mst_ops() {
+        let did = "did:plc:tampertest00000000000001";
+        let rev = "3l7tamper0001";
+        let p256_sk = p256::ecdsa::SigningKey::from_bytes((&[0x41u8; 32]).into()).unwrap();
+        let wrong_p256_sk = p256::ecdsa::SigningKey::from_bytes((&[0x42u8; 32]).into()).unwrap();
+        let wrong_k256_sk = k256::ecdsa::SigningKey::from_bytes((&[0x43u8; 32]).into()).unwrap();
+
+        let dev_path = "blue.catbird.chat.device/3l7realdev";
+        let dev_bytes = encode_device_cbor("ed25519", 0x12, 32);
+        let dev_cid = verify::compute_dagcbor_cid(&dev_bytes);
+
+        let mut mst_map = BTreeMap::new();
+        mst_map.insert(dev_path.to_string(), dev_cid);
+        let mst_bytes = verify::encode_mst_leaf_cbor(&mst_map);
+        let mst_cid = verify::compute_dagcbor_cid(&mst_bytes);
+
+        let unsigned = verify::encode_unsigned_v3_commit_cbor(did, rev, mst_cid, None);
+        let sig = verify::sign_p256_low_s(&p256_sk, &unsigned);
+        let valid_commit =
+            verify::encode_signed_v3_commit_cbor(did, rev, mst_cid, None, sig.clone());
+        let right_vk = AtprotoVerifyingKey::P256(*p256_sk.verifying_key());
+
+        // 1) Tampered MST data root inside commit CBOR while reusing original signature
+        let evil_mst_cid =
+            verify::compute_dagcbor_cid(&verify::encode_mst_leaf_cbor(&BTreeMap::new()));
+        let tampered_data_commit =
+            verify::encode_signed_v3_commit_cbor(did, rev, evil_mst_cid, None, sig.clone());
+        assert_eq!(
+            verify_atproto_v3_commit_signature(&tampered_data_commit, did, rev, &right_vk),
+            Err(CommitVerifyError::InvalidSignature)
+        );
+
+        // 2) Tampered rev in commit CBOR (matching frame rev, breaking signature over unsigned commit)
+        let tampered_rev_commit =
+            verify::encode_signed_v3_commit_cbor(did, "3l7tamper9999", mst_cid, None, sig);
+        assert_eq!(
+            verify_atproto_v3_commit_signature(
+                &tampered_rev_commit,
+                did,
+                "3l7tamper9999",
+                &right_vk
+            ),
+            Err(CommitVerifyError::InvalidSignature)
+        );
+
+        // 3) Commit rev / DID mismatch against outer firehose frame metadata
+        assert!(matches!(
+            verify_atproto_v3_commit_signature(&valid_commit, did, "3l7otherrev00", &right_vk),
+            Err(CommitVerifyError::CommitMetadataMismatch(_))
+        ));
+        assert!(matches!(
+            verify_atproto_v3_commit_signature(
+                &valid_commit,
+                "did:plc:otheractor00000000000009",
+                rev,
+                &right_vk
+            ),
+            Err(CommitVerifyError::CommitMetadataMismatch(_))
+        ));
+
+        // 4) Wrong #atproto key (same curve P-256, and cross-curve secp256k1)
+        let wrong_p256_vk = AtprotoVerifyingKey::P256(*wrong_p256_sk.verifying_key());
+        let wrong_k256_vk = AtprotoVerifyingKey::Secp256k1(*wrong_k256_sk.verifying_key());
+        assert_eq!(
+            verify_atproto_v3_commit_signature(&valid_commit, did, rev, &wrong_p256_vk),
+            Err(CommitVerifyError::InvalidSignature)
+        );
+        assert_eq!(
+            verify_atproto_v3_commit_signature(&valid_commit, did, rev, &wrong_k256_vk),
+            Err(CommitVerifyError::InvalidSignature)
+        );
+
+        // 5) MST inclusion/exclusion checks reject spoofed paths and wrong CIDs
+        let mut blocks = HashMap::new();
+        blocks.insert(mst_cid, mst_bytes.as_slice());
+        assert_eq!(
+            verify_mst_key_lookup(&blocks, mst_cid, dev_path.as_bytes()).unwrap(),
+            Some(dev_cid)
+        );
+        assert_eq!(
+            verify_mst_key_lookup(
+                &blocks,
+                mst_cid,
+                b"blue.catbird.chat.device/3l7spoofedabsent"
+            )
+            .unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn rejects_malformed_der_and_high_s_ecdsa_commit_signatures_for_both_curves() {
+        const P256_ORDER_BE: [u8; 32] = [
+            0xff, 0xff, 0xff, 0xff, 0x00, 0x00, 0x00, 0x00, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+            0xff, 0xff, 0xbc, 0xe6, 0xfa, 0xad, 0xa7, 0x17, 0x9e, 0x84, 0xf3, 0xb9, 0xca, 0xc2,
+            0xfc, 0x63, 0x25, 0x51,
+        ];
+        const K256_ORDER_BE: [u8; 32] = [
+            0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+            0xff, 0xfe, 0xba, 0xae, 0xdc, 0xe6, 0xaf, 0x48, 0xa0, 0x3b, 0xbf, 0xd2, 0x5e, 0x8c,
+            0xd0, 0x36, 0x41, 0x41,
+        ];
+
+        let did = "did:plc:malleabilitytest00000001";
+        let rev = "3l7malleable1";
+        let mst_cid = verify::compute_dagcbor_cid(&verify::encode_mst_leaf_cbor(&BTreeMap::new()));
+        let unsigned = verify::encode_unsigned_v3_commit_cbor(did, rev, mst_cid, None);
+
+        let p256_sk = p256::ecdsa::SigningKey::from_bytes((&[0x61u8; 32]).into()).unwrap();
+        let p256_vk = AtprotoVerifyingKey::P256(*p256_sk.verifying_key());
+        let p256_low = verify::sign_p256_low_s(&p256_sk, &unsigned);
+
+        // Empty, 63-byte, 65-byte, and ASN.1 DER signatures must all fail as MalformedSignature.
+        let p256_der = p256::ecdsa::Signature::from_slice(&p256_low)
+            .unwrap()
+            .to_der()
+            .as_bytes()
+            .to_vec();
+        for bad_sig in [
+            vec![],
+            p256_low[..63].to_vec(),
+            [p256_low.as_slice(), &[0x00]].concat(),
+            p256_der,
+            vec![0x00; 64],
+        ] {
+            let commit_bytes =
+                verify::encode_signed_v3_commit_cbor(did, rev, mst_cid, None, bad_sig);
+            assert!(
+                matches!(
+                    verify_atproto_v3_commit_signature(&commit_bytes, did, rev, &p256_vk),
+                    Err(CommitVerifyError::MalformedSignature(_))
+                ),
+                "expected MalformedSignature"
+            );
+        }
+
+        // Construct genuine malleable high-S P-256 signature (`r || (n - s)`) and prove HighSSignature rejection.
+        let mut p256_high = [0u8; 64];
+        p256_high[..32].copy_from_slice(&p256_low[..32]);
+        let p256_s: [u8; 32] = p256_low[32..].try_into().unwrap();
+        p256_high[32..].copy_from_slice(&sub_be_32(&P256_ORDER_BE, &p256_s));
+        assert_eq!(
+            &p256::ecdsa::Signature::from_slice(&p256_high)
+                .unwrap()
+                .normalize_s()
+                .unwrap()
+                .to_bytes()[..],
+            p256_low.as_slice()
+        );
+        let p256_high_commit =
+            verify::encode_signed_v3_commit_cbor(did, rev, mst_cid, None, p256_high.to_vec());
+        assert_eq!(
+            verify_atproto_v3_commit_signature(&p256_high_commit, did, rev, &p256_vk),
+            Err(CommitVerifyError::HighSSignature)
+        );
+
+        // Construct genuine malleable high-S secp256k1 signature (`r || (n - s)`) and prove HighSSignature rejection.
+        let k256_sk = k256::ecdsa::SigningKey::from_bytes((&[0x71u8; 32]).into()).unwrap();
+        let k256_vk = AtprotoVerifyingKey::Secp256k1(*k256_sk.verifying_key());
+        let k256_low = verify::sign_k256_low_s(&k256_sk, &unsigned);
+        let mut k256_high = [0u8; 32 * 2];
+        k256_high[..32].copy_from_slice(&k256_low[..32]);
+        let k256_s: [u8; 32] = k256_low[32..].try_into().unwrap();
+        k256_high[32..].copy_from_slice(&sub_be_32(&K256_ORDER_BE, &k256_s));
+        assert_eq!(
+            &k256::ecdsa::Signature::from_slice(&k256_high)
+                .unwrap()
+                .normalize_s()
+                .unwrap()
+                .to_bytes()[..],
+            k256_low.as_slice()
+        );
+        let k256_high_commit =
+            verify::encode_signed_v3_commit_cbor(did, rev, mst_cid, None, k256_high.to_vec());
+        assert_eq!(
+            verify_atproto_v3_commit_signature(&k256_high_commit, did, rev, &k256_vk),
+            Err(CommitVerifyError::HighSSignature)
+        );
+    }
+
+    #[tokio::test]
+    async fn rejects_forged_mailbox_keys_signatures_and_off_curve_device_keys() {
+        let mut store = InMemoryWitnessStore::default();
+        let alice = "did:plc:alicesigcheck00000000001";
+
+        // Seed valid epoch 0.
+        let seed_out = evaluate_commit(
+            &mut store,
+            &ObservedCommit {
+                actor_did: alice.to_string(),
+                seq: 1,
+                rev: "3l7sig0000001".to_string(),
+                commit_cid: "bafysig1".to_string(),
+                ops: vec![ObservedRepoOp {
+                    action: "create".to_string(),
+                    path: "blue.catbird.labyrinth.mailboxKeys/000000000000".to_string(),
+                    cid: Some("bafymk0".to_string()),
+                    block: Some(encode_mailbox_cbor(alice, 0, 0x10, None)),
+                }],
+            },
+        )
+        .await
+        .unwrap();
+        assert!(seed_out.anomalies.is_empty());
+
+        // 1) Forged 64-byte `selfSig` (canonical scalar = 1, wrong signature) must be rejected.
+        let mut forged_self: MailboxKeys =
+            serde_ipld_dagcbor::from_slice(&encode_mailbox_cbor(alice, 1, 0x11, Some(0x10)))
+                .unwrap();
+        let mut fake_sig = [0u8; 64];
+        fake_sig[32] = 1;
+        forged_self.current.self_sig = JqBytes::from(fake_sig.to_vec());
+        let forged_self_bytes = serde_ipld_dagcbor::to_vec(&forged_self).unwrap();
+
+        // 2) Forged `prevSig` signed by a rogue X25519 key while `previousEpochHead` matches epoch 0!
+        let mut forged_prev: MailboxKeys =
+            serde_ipld_dagcbor::from_slice(&encode_mailbox_cbor(alice, 1, 0x11, Some(0x10)))
+                .unwrap();
+        let rogue_prev_msg = [verify::LABYRINTH_PREV_SIG_PREFIX, &[0x11u8; 32]].concat();
+        let rogue_prev_sig =
+            verify::xeddsa_sign_deterministic(&[0x99u8; 32], &rogue_prev_msg, &[0x55; 64]);
+        forged_prev.current.prev_sig = Some(JqBytes::from(rogue_prev_sig.to_vec()));
+        let forged_prev_bytes = serde_ipld_dagcbor::to_vec(&forged_prev).unwrap();
+
+        // 3) Forged `attestation.sig` signed for a different DID.
+        let wrong_did_attest_bytes =
+            encode_mailbox_cbor("did:plc:impersonated000000000009", 2, 0x12, Some(0x11));
+
+        // 4) Off-curve 33-byte P-256 `chat.device` key (`0x00` invalid SEC1 tag).
+        let dt: Datetime = "2026-11-13T12:00:00Z".parse().unwrap();
+        let bad_dev: Device = Device {
+            algorithm: "p256".into(),
+            created_at: dt,
+            mls_signature_public_key: JqBytes::from(vec![0x00; 33]),
+            extra_data: None,
+        };
+        let bad_dev_bytes = serde_ipld_dagcbor::to_vec(&bad_dev).unwrap();
+
+        let self_fail_before = metrics::WITNESS_VERIFICATION_FAILURES
+            .with_label_values(&["invalid_mailbox_self_sig"])
+            .get();
+        let prev_fail_before = metrics::WITNESS_VERIFICATION_FAILURES
+            .with_label_values(&["invalid_mailbox_prev_sig"])
+            .get();
+        let attest_fail_before = metrics::WITNESS_VERIFICATION_FAILURES
+            .with_label_values(&["invalid_mailbox_attestation_sig"])
+            .get();
+        let dev_fail_before = metrics::WITNESS_VERIFICATION_FAILURES
+            .with_label_values(&["invalid_chat_device_pubkey"])
+            .get();
+
+        let bad_out = evaluate_commit(
+            &mut store,
+            &ObservedCommit {
+                actor_did: alice.to_string(),
+                seq: 2,
+                rev: "3l7sig0000002".to_string(),
+                commit_cid: "bafysig2".to_string(),
+                ops: vec![
+                    ObservedRepoOp {
+                        action: "create".to_string(),
+                        path: "blue.catbird.labyrinth.mailboxKeys/000000000001".to_string(),
+                        cid: Some("bafymk1_badself".to_string()),
+                        block: Some(forged_self_bytes),
+                    },
+                    ObservedRepoOp {
+                        action: "create".to_string(),
+                        path: "blue.catbird.labyrinth.mailboxKeys/000000000001".to_string(),
+                        cid: Some("bafymk1_badprev".to_string()),
+                        block: Some(forged_prev_bytes),
+                    },
+                    ObservedRepoOp {
+                        action: "create".to_string(),
+                        path: "blue.catbird.labyrinth.mailboxKeys/000000000002".to_string(),
+                        cid: Some("bafymk2_badattest".to_string()),
+                        block: Some(wrong_did_attest_bytes),
+                    },
+                    ObservedRepoOp {
+                        action: "create".to_string(),
+                        path: "blue.catbird.chat.device/3l7badcurve".to_string(),
+                        cid: Some("bafybaddev".to_string()),
+                        block: Some(bad_dev_bytes),
+                    },
+                ],
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(bad_out.indexed_devices, 0);
+        assert_eq!(bad_out.indexed_mailbox_records, 0);
+        let kinds: Vec<WitnessAnomalyKind> = bad_out.anomalies.iter().map(|a| a.kind).collect();
+        assert_eq!(
+            kinds,
+            vec![
+                WitnessAnomalyKind::MalformedTransparencyRecord,
+                WitnessAnomalyKind::MailboxBrokenHashChain,
+                WitnessAnomalyKind::MalformedTransparencyRecord,
+                WitnessAnomalyKind::MalformedTransparencyRecord,
+            ]
+        );
+        assert!(
+            metrics::WITNESS_VERIFICATION_FAILURES
+                .with_label_values(&["invalid_mailbox_self_sig"])
+                .get()
+                > self_fail_before
+        );
+        assert!(
+            metrics::WITNESS_VERIFICATION_FAILURES
+                .with_label_values(&["invalid_mailbox_prev_sig"])
+                .get()
+                > prev_fail_before
+        );
+        assert!(
+            metrics::WITNESS_VERIFICATION_FAILURES
+                .with_label_values(&["invalid_mailbox_attestation_sig"])
+                .get()
+                > attest_fail_before
+        );
+        assert!(
+            metrics::WITNESS_VERIFICATION_FAILURES
+                .with_label_values(&["invalid_chat_device_pubkey"])
+                .get()
+                > dev_fail_before
+        );
+    }
+
+    #[tokio::test]
+    async fn propagates_verification_errors_and_retries_did_key_refresh_once() {
+        let did = "did:plc:errorprop000000000000001";
+        let rev = "3l7errprop222";
+        let real_sk = k256::ecdsa::SigningKey::from_bytes((&[0x81u8; 32]).into()).unwrap();
+        let stale_sk = k256::ecdsa::SigningKey::from_bytes((&[0x82u8; 32]).into()).unwrap();
+
+        let resolver = Arc::new(StaticAtprotoKeyResolver::new());
+        resolver.insert(
+            did,
+            AtprotoVerifyingKey::Secp256k1(*stale_sk.verifying_key()),
+        );
+
+        let lazy_pool = sqlx::postgres::PgPoolOptions::new()
+            .connect_lazy("postgres://unused@127.0.0.1:1/unused")
+            .expect("lazy pool");
+        let consumer = WitnessConsumer::with_key_resolver(lazy_pool, resolver.clone());
+
+        let dev_path = "blue.catbird.chat.device/3l7errdev1";
+        let dev_bytes = encode_device_cbor("ed25519", 0x33, 32);
+        let dev_cid = verify::compute_dagcbor_cid(&dev_bytes);
+        let mut mst_map = BTreeMap::new();
+        mst_map.insert(dev_path.to_string(), dev_cid);
+        let mst_bytes = verify::encode_mst_leaf_cbor(&mst_map);
+        let mst_cid = verify::compute_dagcbor_cid(&mst_bytes);
+        let unsigned = verify::encode_unsigned_v3_commit_cbor(did, rev, mst_cid, None);
+        let sig = verify::sign_k256_low_s(&real_sk, &unsigned);
+        let signed = verify::encode_signed_v3_commit_cbor(did, rev, mst_cid, None, sig);
+        let root_cid = verify::compute_dagcbor_cid(&signed);
+
+        // 1) Wrong `#atproto` key triggers 1 initial lookup + 1 force-refresh retry, then propagates Err!
+        let valid_car = verify::encode_car_v1(
+            &[root_cid],
+            &[
+                (root_cid, signed.clone()),
+                (mst_cid, mst_bytes.clone()),
+                (dev_cid, dev_bytes.clone()),
+            ],
+        );
+        let msg_wrong_key = build_subscribe_repos_commit_msg(
+            did,
+            rev,
+            10,
+            root_cid,
+            valid_car.clone(),
+            vec![("create", dev_path, Some(dev_cid))],
+        );
+        let err = consumer
+            .handle_event(msg_wrong_key)
+            .await
+            .expect_err("wrong #atproto key must return Err");
+        assert_eq!(
+            err.downcast_ref::<CommitVerifyError>(),
+            Some(&CommitVerifyError::InvalidSignature)
+        );
+        assert_eq!(resolver.lookup_count(), 2);
+        assert_eq!(resolver.force_refresh_count(), 1);
+        assert_eq!(consumer.verification_failures_count(), 1);
+
+        // 2) Spoofed `commit.ops` claiming an extra un-committed device key fails MST proof and propagates Err!
+        resolver.insert(
+            did,
+            AtprotoVerifyingKey::Secp256k1(*real_sk.verifying_key()),
+        );
+        let msg_spoofed_op = build_subscribe_repos_commit_msg(
+            did,
+            rev,
+            11,
+            root_cid,
+            valid_car,
+            vec![(
+                "create",
+                "blue.catbird.chat.device/3l7spoofed",
+                Some(dev_cid),
+            )],
+        );
+        let err_mst = consumer
+            .handle_event(msg_spoofed_op)
+            .await
+            .expect_err("spoofed repo op must fail MST verification");
+        assert!(matches!(
+            err_mst.downcast_ref::<CommitVerifyError>(),
+            Some(CommitVerifyError::MstProofFailed(_))
+        ));
+        assert_eq!(consumer.verification_failures_count(), 2);
+
+        // 3) Empty CAR on transparency commit propagates EmptyCar Err!
+        let msg_empty = build_subscribe_repos_commit_msg(
+            did,
+            rev,
+            12,
+            root_cid,
+            vec![],
+            vec![("delete", dev_path, None)],
+        );
+        let err_empty = consumer
+            .handle_event(msg_empty)
+            .await
+            .expect_err("empty CAR must fail verification");
+        assert_eq!(
+            err_empty.downcast_ref::<CommitVerifyError>(),
+            Some(&CommitVerifyError::EmptyCar)
+        );
+        assert_eq!(consumer.verification_failures_count(), 3);
     }
 }
