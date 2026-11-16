@@ -2379,9 +2379,7 @@ mod tests {
 
     #[tokio::test]
     async fn postgres_migration_persists_witnessed_state_and_anomalies() {
-        let user = std::env::var("USER").unwrap_or_else(|_| "postgres".to_string());
-        let db_url = std::env::var("WITNESS_TEST_DATABASE_URL")
-            .unwrap_or_else(|_| format!("postgres://{user}@127.0.0.1:5432/postgres"));
+        let db_url = witness_test_database_url();
         let schema = format!("witness_test_{}", uuid::Uuid::new_v4().simple());
 
         let admin_pool = sqlx::postgres::PgPoolOptions::new()
@@ -3280,6 +3278,20 @@ mod tests {
         }
     }
 
+    /// Postgres for the witness storage tests. There is deliberately no default: the tests
+    /// create and drop schemas, so they must only ever run against a database the caller
+    /// named for that purpose.
+    fn witness_test_database_url() -> String {
+        match std::env::var("WITNESS_TEST_DATABASE_URL") {
+            Ok(url) if !url.trim().is_empty() => url,
+            _ => panic!(
+                "WITNESS_TEST_DATABASE_URL is not set. The witness Postgres tests need a \
+                 disposable database they may create and drop schemas in, for example a \
+                 throwaway cluster started with initdb + pg_ctl on a free port."
+            ),
+        }
+    }
+
     async fn apply_witness_migrations(pool: &sqlx::PgPool) {
         apply_migrations(pool, &WITNESS_MIGRATIONS).await;
     }
@@ -3293,9 +3305,7 @@ mod tests {
     async fn isolated_schema_pool(
         migrations: &[(&str, &str)],
     ) -> (sqlx::PgPool, sqlx::PgPool, String) {
-        let user = std::env::var("USER").unwrap_or_else(|_| "postgres".to_string());
-        let db_url = std::env::var("WITNESS_TEST_DATABASE_URL")
-            .unwrap_or_else(|_| format!("postgres://{user}@127.0.0.1:5432/postgres"));
+        let db_url = witness_test_database_url();
         let schema = format!("witness_test_{}", uuid::Uuid::new_v4().simple());
         let admin_pool = sqlx::postgres::PgPoolOptions::new()
             .max_connections(2)

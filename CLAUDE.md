@@ -28,6 +28,11 @@ cargo test                         # Run tests
 
 Use `SQLX_OFFLINE=true` for CI or when no PostgreSQL instance is available.
 
+The consumer-witness storage tests need `WITNESS_TEST_DATABASE_URL` pointing at a disposable
+Postgres they may create and drop schemas in (for example a throwaway `initdb` + `pg_ctl`
+cluster on a free port). There is no default; without it those tests fail with a message
+saying so. Every other test runs without a database.
+
 ## Architecture / Data Flow
 
 ```
