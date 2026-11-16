@@ -1,18 +1,18 @@
-//! Real ingest-loop regressions. Each test uses an isolated SQLx database and a
-//! local relay; no upstream firehose, push service, or production DB is used.
-//! Run with SQLX_OFFLINE=true DATABASE_URL=postgresql://localhost/postgres
-//! cargo test -p catbird-firehose-ingest --test reconnect -- --ignored.
+//! Real ingest-loop regressions against a local WebSocket relay. The cursor
+//! checkpoint is held in memory, so these run in the default `cargo test`
+//! with no database, upstream firehose, or push service.
 
 // Tungstenite requires its unboxed HTTP error response in handshake callbacks.
 #![allow(clippy::result_large_err)]
 
 use std::{sync::Arc, time::Duration};
 
-use catbird_firehose_ingest::connection::run_firehose_ingest;
+use catbird_firehose_ingest::{
+    connection::run_firehose_ingest_with_store, cursor::MemoryCursorStore,
+};
 use ciborium::Value;
 use futures::SinkExt;
 use jacquard_api::com_atproto::sync::subscribe_repos::SubscribeReposMessage;
-use sqlx::PgPool;
 use tokio::{
     net::TcpListener,
     sync::{broadcast, mpsc, watch},
@@ -56,17 +56,8 @@ fn commit_frame(seq: i64, rev: &str) -> Vec<u8> {
     bytes
 }
 
-async fn seed_cursor(pool: &PgPool) {
-    sqlx::raw_sql(
-        "CREATE TABLE firehose_cursor (
-            id SERIAL PRIMARY KEY, cursor TEXT NOT NULL,
-            updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-        );
-        INSERT INTO firehose_cursor (cursor) VALUES ('100');",
-    )
-    .execute(pool)
-    .await
-    .unwrap();
+fn seeded_cursor() -> Arc<MemoryCursorStore> {
+    Arc::new(MemoryCursorStore::with_cursor(100))
 }
 
 async fn next_seq(receiver: &mut broadcast::Receiver<Arc<SubscribeReposMessage>>) -> i64 {
@@ -80,10 +71,9 @@ async fn next_seq(receiver: &mut broadcast::Receiver<Arc<SubscribeReposMessage>>
     }
 }
 
-#[sqlx::test(migrations = false)]
-#[ignore = "requires a local PostgreSQL admin DATABASE_URL; creates an isolated test database"]
-async fn malformed_tid_does_not_replay_preceding_commit(pool: PgPool) {
-    seed_cursor(&pool).await;
+#[tokio::test]
+async fn malformed_tid_does_not_replay_preceding_commit() {
+    let cursor = seeded_cursor();
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let endpoint = format!("ws://{}", listener.local_addr().unwrap());
     let (connections, mut observed_connections) = mpsc::unbounded_channel();
@@ -112,7 +102,12 @@ async fn malformed_tid_does_not_replay_preceding_commit(pool: PgPool) {
     });
     let (dispatcher, mut receiver) = broadcast::channel(16);
     let (stop, shutdown) = watch::channel(false);
-    let ingest = tokio::spawn(run_firehose_ingest(endpoint, dispatcher, pool, shutdown));
+    let ingest = tokio::spawn(run_firehose_ingest_with_store(
+        endpoint,
+        dispatcher,
+        cursor.clone(),
+        shutdown,
+    ));
 
     let received = [next_seq(&mut receiver).await, next_seq(&mut receiver).await];
     stop.send(true).unwrap();
@@ -139,10 +134,9 @@ async fn malformed_tid_does_not_replay_preceding_commit(pool: PgPool) {
     );
 }
 
-#[sqlx::test(migrations = false)]
-#[ignore = "requires a local PostgreSQL admin DATABASE_URL; creates an isolated test database"]
-async fn transport_reconnect_resumes_latest_dispatched_cursor(pool: PgPool) {
-    seed_cursor(&pool).await;
+#[tokio::test]
+async fn transport_reconnect_resumes_latest_dispatched_cursor() {
+    let cursor = seeded_cursor();
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let endpoint = format!("ws://{}", listener.local_addr().unwrap());
     let (connections, mut observed_connections) = mpsc::unbounded_channel();
@@ -170,7 +164,12 @@ async fn transport_reconnect_resumes_latest_dispatched_cursor(pool: PgPool) {
     });
     let (dispatcher, mut receiver) = broadcast::channel(16);
     let (stop, shutdown) = watch::channel(false);
-    let ingest = tokio::spawn(run_firehose_ingest(endpoint, dispatcher, pool, shutdown));
+    let ingest = tokio::spawn(run_firehose_ingest_with_store(
+        endpoint,
+        dispatcher,
+        cursor.clone(),
+        shutdown,
+    ));
     assert_eq!(next_seq(&mut receiver).await, 101);
     let first = observed_connections.recv().await.unwrap();
     let second = timeout(Duration::from_secs(5), observed_connections.recv())
@@ -195,10 +194,9 @@ async fn transport_reconnect_resumes_latest_dispatched_cursor(pool: PgPool) {
     );
 }
 
-#[sqlx::test(migrations = false)]
-#[ignore = "requires a local PostgreSQL admin DATABASE_URL; creates an isolated test database"]
-async fn immediately_closed_streams_back_off_before_reconnecting(pool: PgPool) {
-    seed_cursor(&pool).await;
+#[tokio::test]
+async fn immediately_closed_streams_back_off_before_reconnecting() {
+    let cursor = seeded_cursor();
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let endpoint = format!("ws://{}", listener.local_addr().unwrap());
     let (connections, mut observed_connections) = mpsc::unbounded_channel();
@@ -214,7 +212,12 @@ async fn immediately_closed_streams_back_off_before_reconnecting(pool: PgPool) {
     });
     let (dispatcher, _receiver) = broadcast::channel(16);
     let (stop, shutdown) = watch::channel(false);
-    let ingest = tokio::spawn(run_firehose_ingest(endpoint, dispatcher, pool, shutdown));
+    let ingest = tokio::spawn(run_firehose_ingest_with_store(
+        endpoint,
+        dispatcher,
+        cursor.clone(),
+        shutdown,
+    ));
     let first = timeout(Duration::from_secs(5), observed_connections.recv())
         .await
         .unwrap()

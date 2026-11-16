@@ -17,7 +17,7 @@ use jacquard_api::com_atproto::sync::subscribe_repos::{
     SubscribeRepos, SubscribeReposMessage, SubscribeReposStream,
 };
 
-use crate::cursor;
+use crate::cursor::{CursorStore, PgCursorStore};
 
 const MAX_RECONNECTS: u32 = 10;
 const HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(60);
@@ -29,6 +29,22 @@ pub async fn run_firehose_ingest(
     firehose_url: String,
     dispatcher: broadcast::Sender<Arc<SubscribeReposMessage>>,
     db_pool: Pool<Postgres>,
+    shutdown: watch::Receiver<bool>,
+) -> Result<()> {
+    run_firehose_ingest_with_store(
+        firehose_url,
+        dispatcher,
+        PgCursorStore::new(db_pool),
+        shutdown,
+    )
+    .await
+}
+
+/// [`run_firehose_ingest`] with an explicit cursor checkpoint store.
+pub async fn run_firehose_ingest_with_store<S: CursorStore>(
+    firehose_url: String,
+    dispatcher: broadcast::Sender<Arc<SubscribeReposMessage>>,
+    cursor_store: S,
     mut shutdown: watch::Receiver<bool>,
 ) -> Result<()> {
     info!("Starting firehose ingest");
@@ -37,7 +53,7 @@ pub async fn run_firehose_ingest(
     let mut reconnect_attempts = 0u32;
     // The persisted cursor is only a periodic checkpoint. Reading it again on
     // each reconnect replays events already dispatched since that checkpoint.
-    let mut last_cursor = match cursor::get_last_cursor(&db_pool).await {
+    let mut last_cursor = match cursor_store.load().await {
         Ok(c) => c,
         Err(e) => {
             error!("Failed to get last cursor: {}", e);
@@ -116,7 +132,7 @@ pub async fn run_firehose_ingest(
                             } else if let Some(seq) = sequence {
                                 last_cursor = Some(seq);
                                 if seq % 100 == 0 {
-                                    if let Err(e) = cursor::update_cursor(&db_pool, seq).await {
+                                    if let Err(e) = cursor_store.save(seq).await {
                                         error!("Failed to update cursor: {}", e);
                                     }
                                 }

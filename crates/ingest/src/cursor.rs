@@ -1,6 +1,87 @@
+use std::future::Future;
+use std::sync::Mutex;
+
 use anyhow::Result;
 use sqlx::{FromRow, Pool, Postgres};
 use tracing::info;
+
+/// Durable checkpoint of the last dispatched firehose sequence number.
+///
+/// The ingest loop reads the checkpoint once at startup and writes it
+/// periodically while dispatching. Production uses [`PgCursorStore`];
+/// [`MemoryCursorStore`] keeps the same contract in memory.
+pub trait CursorStore: Send + Sync + 'static {
+    fn load(&self) -> impl Future<Output = Result<Option<i64>>> + Send;
+    fn save(&self, seq: i64) -> impl Future<Output = Result<()>> + Send;
+}
+
+/// `firehose_cursor` table checkpoint.
+#[derive(Clone)]
+pub struct PgCursorStore {
+    pool: Pool<Postgres>,
+}
+
+impl PgCursorStore {
+    pub fn new(pool: Pool<Postgres>) -> Self {
+        Self { pool }
+    }
+}
+
+impl CursorStore for PgCursorStore {
+    async fn load(&self) -> Result<Option<i64>> {
+        get_last_cursor(&self.pool).await
+    }
+
+    async fn save(&self, seq: i64) -> Result<()> {
+        update_cursor(&self.pool, seq).await
+    }
+}
+
+/// In-process checkpoint that records every save, in order.
+#[derive(Debug, Default)]
+pub struct MemoryCursorStore {
+    cursor: Mutex<Option<i64>>,
+    saves: Mutex<Vec<i64>>,
+}
+
+impl MemoryCursorStore {
+    pub fn with_cursor(seq: i64) -> Self {
+        Self {
+            cursor: Mutex::new(Some(seq)),
+            saves: Mutex::new(Vec::new()),
+        }
+    }
+
+    pub fn current(&self) -> Option<i64> {
+        *self.cursor.lock().expect("cursor lock")
+    }
+
+    pub fn saves(&self) -> Vec<i64> {
+        self.saves.lock().expect("saves lock").clone()
+    }
+}
+
+impl CursorStore for MemoryCursorStore {
+    async fn load(&self) -> Result<Option<i64>> {
+        Ok(self.current())
+    }
+
+    async fn save(&self, seq: i64) -> Result<()> {
+        *self.cursor.lock().expect("cursor lock") = Some(seq);
+        self.saves.lock().expect("saves lock").push(seq);
+        Ok(())
+    }
+}
+
+impl<T: CursorStore> CursorStore for std::sync::Arc<T> {
+    fn load(&self) -> impl Future<Output = Result<Option<i64>>> + Send {
+        T::load(self)
+    }
+
+    fn save(&self, seq: i64) -> impl Future<Output = Result<()>> + Send {
+        T::save(self, seq)
+    }
+}
 
 #[derive(Debug, Clone, FromRow)]
 pub struct FirehoseCursor {
