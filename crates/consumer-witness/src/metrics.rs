@@ -49,6 +49,19 @@ lazy_static! {
         "Total number of times the witness consumer lagged behind the firehose"
     ))
     .unwrap();
+    pub static ref WITNESS_UNVERIFIED_RECORDED: CounterVec = register_counter_vec!(
+        Opts::new(
+            "firehose_witness_unverified_total",
+            "Total number of transparency commits or ops recorded as unverified instead of witnessed, by reason"
+        ),
+        &["reason"]
+    )
+    .unwrap();
+    pub static ref WITNESS_STREAM_GAPS_RECORDED: Counter = register_counter!(Opts::new(
+        "firehose_witness_stream_gaps_total",
+        "Total number of firehose stream gaps recorded in witness_stream_gaps"
+    ))
+    .unwrap();
     pub static ref WITNESS_CONSUMER_DROPPED_EVENTS: Counter = register_counter!(Opts::new(
         "firehose_witness_consumer_dropped_events_total",
         "Total number of firehose events dropped before reaching the witness consumer"

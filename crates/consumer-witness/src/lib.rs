@@ -23,8 +23,8 @@ pub use verify::{
 use std::collections::HashMap;
 use std::io::Cursor;
 use std::sync::{
-    atomic::{AtomicU64, Ordering},
-    Arc,
+    atomic::{AtomicI64, AtomicU64, Ordering},
+    Arc, Mutex,
 };
 
 use anyhow::Result;
@@ -121,6 +121,10 @@ pub struct MailboxEpochRecord {
     pub prev_sig: Option<Vec<u8>>,
     pub backend: Option<String>,
     pub immutable_pinned: bool,
+    /// `true` only when `previousEpochHead` and `prevSig` were checked against a witnessed
+    /// predecessor epoch, or the epoch is 0. An epoch whose predecessor was never witnessed is
+    /// stored so later epochs can link to it, but it is not counted as witnessed.
+    pub chain_verified: bool,
     pub first_seen_seq: i64,
     pub first_seen_rev: String,
 }
@@ -160,6 +164,35 @@ pub struct AnomalyRecord {
     pub detail: String,
 }
 
+/// `op_path` used for verdicts that cover a whole commit rather than one op.
+pub const COMMIT_LEVEL_OP_PATH: &str = "#commit";
+/// A mailbox epoch whose predecessor epoch was never witnessed, so its hash/signature chain
+/// link cannot be checked.
+pub const UNVERIFIED_PRIOR_EPOCH_UNWITNESSED: &str = "prior_epoch_unwitnessed";
+/// A verified commit that could not be written to the witness store.
+pub const UNVERIFIED_WITNESS_STORE_ERROR: &str = "witness_store_error";
+
+/// A transparency commit or op the witness withheld instead of witnessing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnverifiedCommitRecord {
+    pub actor_did: String,
+    pub seq: i64,
+    pub commit_rev: String,
+    pub commit_cid: Option<String>,
+    pub op_path: String,
+    pub claimed_paths: Vec<String>,
+    pub reason: String,
+    pub detail: String,
+}
+
+/// Firehose events that never reached the witness (broadcast lag).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StreamGapRecord {
+    pub dropped_events: u64,
+    pub last_seq_before_gap: Option<i64>,
+    pub first_seq_after_gap: Option<i64>,
+}
+
 #[derive(Debug, Clone)]
 pub struct ObservedRepoOp {
     pub action: String,
@@ -180,8 +213,11 @@ pub struct ObservedCommit {
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct WitnessOutcome {
     pub indexed_devices: usize,
+    /// Mailbox records stored with a verified chain link (never includes withheld epochs).
     pub indexed_mailbox_records: usize,
     pub anomalies: Vec<AnomalyRecord>,
+    /// Ops recorded as unverified instead of witnessed.
+    pub unverified: Vec<UnverifiedCommitRecord>,
 }
 
 pub fn is_transparency_path(path: &str) -> bool {
@@ -329,6 +365,7 @@ fn parse_mailbox_keys_block(
         prev_sig: cur.prev_sig.as_ref().map(|b| b.to_vec()),
         backend: parsed.backend.as_ref().map(|b| b.as_str().to_string()),
         immutable_pinned,
+        chain_verified: cur.epoch_number == 0,
         first_seen_seq: seq,
         first_seen_rev: rev.to_string(),
     })
@@ -367,6 +404,14 @@ pub trait WitnessStore {
     async fn set_mailbox_head(&mut self, actor_did: &str, head: &MailboxHeadRecord) -> Result<()>;
 
     async fn record_anomaly(&mut self, actor_did: &str, anomaly: &AnomalyRecord) -> Result<bool>;
+
+    async fn mark_mailbox_epoch_chain_verified(
+        &mut self,
+        actor_did: &str,
+        epoch_number: i64,
+    ) -> Result<()>;
+
+    async fn record_unverified(&mut self, rec: &UnverifiedCommitRecord) -> Result<bool>;
 }
 
 pub struct PgWitnessStore<'a, 'c> {
@@ -433,6 +478,18 @@ impl WitnessStore for PgWitnessStore<'_, '_> {
     async fn record_anomaly(&mut self, actor_did: &str, anomaly: &AnomalyRecord) -> Result<bool> {
         db::insert_anomaly(self.tx, actor_did, anomaly).await
     }
+
+    async fn mark_mailbox_epoch_chain_verified(
+        &mut self,
+        actor_did: &str,
+        epoch_number: i64,
+    ) -> Result<()> {
+        db::mark_mailbox_epoch_chain_verified(self.tx, actor_did, epoch_number).await
+    }
+
+    async fn record_unverified(&mut self, rec: &UnverifiedCommitRecord) -> Result<bool> {
+        db::insert_unverified_commit(&mut **self.tx, rec).await
+    }
 }
 
 #[derive(Debug, Default)]
@@ -442,6 +499,7 @@ pub struct InMemoryWitnessStore {
     pub mailbox_epochs: HashMap<(String, i64), MailboxEpochRecord>,
     pub mailbox_heads: HashMap<String, MailboxHeadRecord>,
     pub anomalies: Vec<(String, AnomalyRecord)>,
+    pub unverified: Vec<UnverifiedCommitRecord>,
 }
 
 impl WitnessStore for InMemoryWitnessStore {
@@ -509,6 +567,7 @@ impl WitnessStore for InMemoryWitnessStore {
                 existing.rkey = rec.rkey.clone();
                 existing.immutable_pinned = true;
             }
+            existing.chain_verified |= rec.chain_verified;
         } else {
             self.mailbox_epochs.insert(key, rec.clone());
         }
@@ -537,6 +596,34 @@ impl WitnessStore for InMemoryWitnessStore {
         }
         self.anomalies
             .push((actor_did.to_string(), anomaly.clone()));
+        Ok(true)
+    }
+
+    async fn mark_mailbox_epoch_chain_verified(
+        &mut self,
+        actor_did: &str,
+        epoch_number: i64,
+    ) -> Result<()> {
+        if let Some(existing) = self
+            .mailbox_epochs
+            .get_mut(&(actor_did.to_string(), epoch_number))
+        {
+            existing.chain_verified = true;
+        }
+        Ok(())
+    }
+
+    async fn record_unverified(&mut self, rec: &UnverifiedCommitRecord) -> Result<bool> {
+        let dup = self.unverified.iter().any(|u| {
+            u.actor_did == rec.actor_did
+                && u.seq == rec.seq
+                && u.op_path == rec.op_path
+                && u.reason == rec.reason
+        });
+        if dup {
+            return Ok(false);
+        }
+        self.unverified.push(rec.clone());
         Ok(true)
     }
 }
@@ -577,6 +664,28 @@ async fn emit_anomaly<S: WitnessStore>(
         );
     }
     outcome.anomalies.push(anomaly);
+    Ok(())
+}
+
+async fn emit_unverified<S: WitnessStore>(
+    store: &mut S,
+    rec: UnverifiedCommitRecord,
+    outcome: &mut WitnessOutcome,
+) -> Result<()> {
+    if store.record_unverified(&rec).await? {
+        metrics::WITNESS_UNVERIFIED_RECORDED
+            .with_label_values(&[rec.reason.as_str()])
+            .inc();
+        warn!(
+            actor_did = %rec.actor_did,
+            seq = rec.seq,
+            path = %rec.op_path,
+            reason = %rec.reason,
+            detail = %rec.detail,
+            "Withheld transparency record as unverified"
+        );
+    }
+    outcome.unverified.push(rec);
     Ok(())
 }
 
@@ -873,7 +982,7 @@ async fn evaluate_mailbox_keys_op<S: WitnessStore>(
         return Ok(());
     };
 
-    let parsed = match parse_mailbox_keys_block(
+    let mut parsed = match parse_mailbox_keys_block(
         &commit.actor_did,
         rkey,
         cid,
@@ -961,7 +1070,9 @@ async fn evaluate_mailbox_keys_op<S: WitnessStore>(
         .get_mailbox_epoch(&commit.actor_did, parsed.epoch_number)
         .await?
     {
-        if !existing_same.cryptographic_material_matches(&parsed) {
+        if existing_same.cryptographic_material_matches(&parsed) {
+            parsed.chain_verified |= existing_same.chain_verified;
+        } else {
             emit_anomaly(
                 store,
                 commit,
@@ -1056,6 +1167,7 @@ async fn evaluate_mailbox_keys_op<S: WitnessStore>(
                     .await?;
                     return Ok(());
                 }
+                parsed.chain_verified = true;
             }
         }
     }
@@ -1113,6 +1225,11 @@ async fn evaluate_mailbox_keys_op<S: WitnessStore>(
                 )
                 .await?;
                 return Ok(());
+            }
+            if !next_epoch.chain_verified {
+                store
+                    .mark_mailbox_epoch_chain_verified(&commit.actor_did, next_epoch_num)
+                    .await?;
             }
         }
     }
@@ -1207,10 +1324,32 @@ async fn evaluate_mailbox_keys_op<S: WitnessStore>(
         }
     }
 
-    outcome.indexed_mailbox_records += 1;
-    metrics::WITNESS_RECORDS_INDEXED
-        .with_label_values(&[MAILBOX_KEYS_COLLECTION])
-        .inc();
+    if parsed.chain_verified {
+        outcome.indexed_mailbox_records += 1;
+        metrics::WITNESS_RECORDS_INDEXED
+            .with_label_values(&[MAILBOX_KEYS_COLLECTION])
+            .inc();
+    } else {
+        emit_unverified(
+            store,
+            UnverifiedCommitRecord {
+                actor_did: commit.actor_did.clone(),
+                seq: commit.seq,
+                commit_rev: commit.rev.clone(),
+                commit_cid: Some(commit.commit_cid.clone()),
+                op_path: op.path.clone(),
+                claimed_paths: vec![op.path.clone()],
+                reason: UNVERIFIED_PRIOR_EPOCH_UNWITNESSED.to_string(),
+                detail: format!(
+                    "epoch {} predecessor epoch {} was never witnessed; previousEpochHead and prevSig are unchecked",
+                    parsed.epoch_number,
+                    parsed.epoch_number - 1
+                ),
+            },
+            outcome,
+        )
+        .await?;
+    }
     Ok(())
 }
 
@@ -1220,6 +1359,18 @@ pub struct WitnessConsumer {
     db_pool: Pool<Postgres>,
     key_resolver: Arc<dyn AtprotoKeyResolver>,
     verification_failures: AtomicU64,
+    /// Last `#commit` seq received, `NO_SEQ` before the first one.
+    last_seq: AtomicI64,
+    /// Events dropped by broadcast lag and not yet written to `witness_stream_gaps`.
+    pending_gap: Mutex<Option<PendingGap>>,
+}
+
+const NO_SEQ: i64 = i64::MIN;
+
+#[derive(Debug, Clone, Copy)]
+struct PendingGap {
+    dropped_events: u64,
+    last_seq_before_gap: Option<i64>,
 }
 
 impl WitnessConsumer {
@@ -1235,6 +1386,92 @@ impl WitnessConsumer {
             db_pool,
             key_resolver,
             verification_failures: AtomicU64::new(0),
+            last_seq: AtomicI64::new(NO_SEQ),
+            pending_gap: Mutex::new(None),
+        }
+    }
+
+    fn last_seq(&self) -> Option<i64> {
+        match self.last_seq.load(Ordering::Acquire) {
+            NO_SEQ => None,
+            seq => Some(seq),
+        }
+    }
+
+    /// Write any pending broadcast-lag gap, closing it at `first_seq_after_gap`. On failure
+    /// the gap stays pending and is retried with the next event.
+    async fn flush_pending_gap(&self, first_seq_after_gap: Option<i64>) {
+        let Some(gap) = self.pending_gap.lock().expect("pending gap lock").take() else {
+            return;
+        };
+        let record = StreamGapRecord {
+            dropped_events: gap.dropped_events,
+            last_seq_before_gap: gap.last_seq_before_gap,
+            first_seq_after_gap,
+        };
+        match db::insert_stream_gap(&self.db_pool, &record).await {
+            Ok(()) => {
+                metrics::WITNESS_STREAM_GAPS_RECORDED.inc();
+                warn!(
+                    dropped_events = record.dropped_events,
+                    last_seq_before_gap = ?record.last_seq_before_gap,
+                    first_seq_after_gap = ?record.first_seq_after_gap,
+                    "Recorded witness stream gap; transparency state in this range is unverified"
+                );
+            }
+            Err(err) => {
+                let mut pending = self.pending_gap.lock().expect("pending gap lock");
+                let merged = match pending.take() {
+                    Some(newer) => PendingGap {
+                        dropped_events: gap.dropped_events.saturating_add(newer.dropped_events),
+                        last_seq_before_gap: gap.last_seq_before_gap,
+                    },
+                    None => gap,
+                };
+                *pending = Some(merged);
+                warn!(error = %err, "Failed to record witness stream gap; will retry");
+            }
+        }
+    }
+
+    /// Durably withhold a whole commit the witness did not witness.
+    async fn record_commit_unverified(
+        &self,
+        commit: &jacquard_api::com_atproto::sync::subscribe_repos::Commit,
+        reason: &str,
+        detail: String,
+    ) {
+        let rec = UnverifiedCommitRecord {
+            actor_did: commit.repo.as_ref().to_string(),
+            seq: commit.seq,
+            commit_rev: commit.rev.as_ref().to_string(),
+            commit_cid: commit.commit.to_ipld().ok().map(|cid| cid.to_string()),
+            op_path: COMMIT_LEVEL_OP_PATH.to_string(),
+            claimed_paths: commit
+                .ops
+                .iter()
+                .map(|op| op.path.as_ref())
+                .filter(|path| is_transparency_path(path))
+                .map(str::to_string)
+                .collect(),
+            reason: reason.to_string(),
+            detail,
+        };
+        match db::insert_unverified_commit(&self.db_pool, &rec).await {
+            Ok(inserted) => {
+                if inserted {
+                    metrics::WITNESS_UNVERIFIED_RECORDED
+                        .with_label_values(&[reason])
+                        .inc();
+                }
+            }
+            Err(err) => warn!(
+                actor_did = %rec.actor_did,
+                seq = rec.seq,
+                reason,
+                error = %err,
+                "Failed to record withheld transparency commit"
+            ),
         }
     }
 
@@ -1575,6 +1812,18 @@ impl Consumer for WitnessConsumer {
     fn handle_lag(&self, dropped_events: u64) {
         metrics::WITNESS_CONSUMER_LAG_EVENTS.inc();
         metrics::WITNESS_CONSUMER_DROPPED_EVENTS.inc_by(dropped_events as f64);
+        let last_seq_before_gap = self.last_seq();
+        let mut pending = self.pending_gap.lock().expect("pending gap lock");
+        *pending = Some(match pending.take() {
+            Some(open) => PendingGap {
+                dropped_events: open.dropped_events.saturating_add(dropped_events),
+                last_seq_before_gap: open.last_seq_before_gap,
+            },
+            None => PendingGap {
+                dropped_events,
+                last_seq_before_gap,
+            },
+        });
     }
 
     fn handle_error(&self, _error: &anyhow::Error) {
@@ -1582,6 +1831,15 @@ impl Consumer for WitnessConsumer {
     }
 
     async fn handle_event(&self, event: Arc<SubscribeReposMessage>) -> Result<()> {
+        let seq = match event.as_ref() {
+            SubscribeReposMessage::Commit(commit) => Some(commit.seq),
+            _ => None,
+        };
+        self.flush_pending_gap(seq).await;
+        if let Some(seq) = seq {
+            self.last_seq.store(seq, Ordering::Release);
+        }
+
         let SubscribeReposMessage::Commit(commit) = event.as_ref() else {
             return Ok(());
         };
@@ -1609,11 +1867,21 @@ impl Consumer for WitnessConsumer {
                     error = %err,
                     "Rejected firehose transparency commit failing cryptographic/Merkle verification"
                 );
+                self.record_commit_unverified(commit, err.metric_reason(), err.to_string())
+                    .await;
                 return Err(anyhow::Error::new(err));
             }
         };
 
-        self.ingest_observed_commit(&observed).await?;
+        if let Err(err) = self.ingest_observed_commit(&observed).await {
+            self.record_commit_unverified(
+                commit,
+                UNVERIFIED_WITNESS_STORE_ERROR,
+                format!("verified commit could not be stored: {err}"),
+            )
+            .await;
+            return Err(err);
+        }
         Ok(())
     }
 }
@@ -2073,12 +2341,7 @@ mod tests {
             .await
             .expect("connect scoped witness pool");
 
-        let migration_up =
-            include_str!("../../../migrations/20261113000000_add_device_key_witness.up.sql");
-        sqlx::raw_sql(migration_up)
-            .execute(&pool)
-            .await
-            .expect("apply witness up migration");
+        apply_witness_migrations(&pool).await;
 
         let did = "did:plc:davepgwitness00000000004";
         let dave_p256_sk = p256::ecdsa::SigningKey::from_bytes((&[0x44u8; 32]).into())
@@ -2408,7 +2671,19 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(out_ceiling.anomalies.len(), 0);
-        assert_eq!(out_ceiling.indexed_mailbox_records, 1);
+        // The ceiling epoch parses and is pinned, but its predecessor was never witnessed, so
+        // it is withheld rather than counted as witnessed.
+        assert_eq!(out_ceiling.indexed_mailbox_records, 0);
+        assert_eq!(out_ceiling.unverified.len(), 1);
+        assert_eq!(
+            out_ceiling.unverified[0].reason,
+            UNVERIFIED_PRIOR_EPOCH_UNWITNESSED
+        );
+        let pinned = store
+            .mailbox_epochs
+            .get(&(alice.to_string(), MAX_MAILBOX_EPOCH_NUMBER))
+            .expect("ceiling epoch is pinned");
+        assert!(!pinned.chain_verified);
     }
 
     #[test]
@@ -2914,6 +3189,271 @@ mod tests {
         );
     }
 
+    async fn apply_witness_migrations(pool: &sqlx::PgPool) {
+        for (name, sql) in [
+            (
+                "20261113000000_add_device_key_witness",
+                include_str!("../../../migrations/20261113000000_add_device_key_witness.up.sql"),
+            ),
+            (
+                "20261116000000_add_witness_unverified_commits",
+                include_str!(
+                    "../../../migrations/20261116000000_add_witness_unverified_commits.up.sql"
+                ),
+            ),
+        ] {
+            sqlx::raw_sql(sql)
+                .execute(pool)
+                .await
+                .unwrap_or_else(|e| panic!("apply witness migration {name}: {e}"));
+        }
+    }
+
+    /// Isolated schema on the test database named by `WITNESS_TEST_DATABASE_URL`.
+    async fn isolated_witness_pool() -> (sqlx::PgPool, sqlx::PgPool, String) {
+        let user = std::env::var("USER").unwrap_or_else(|_| "postgres".to_string());
+        let db_url = std::env::var("WITNESS_TEST_DATABASE_URL")
+            .unwrap_or_else(|_| format!("postgres://{user}@127.0.0.1:5432/postgres"));
+        let schema = format!("witness_test_{}", uuid::Uuid::new_v4().simple());
+        let admin_pool = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(2)
+            .connect(&db_url)
+            .await
+            .expect("connect test postgres for isolated witness schema");
+        sqlx::query(&format!("CREATE SCHEMA \"{schema}\""))
+            .execute(&admin_pool)
+            .await
+            .expect("create isolated witness schema");
+        let schema_for_conn = schema.clone();
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(3)
+            .after_connect(move |conn, _meta| {
+                let s = schema_for_conn.clone();
+                Box::pin(async move {
+                    sqlx::query(&format!("SET search_path TO \"{s}\""))
+                        .execute(conn)
+                        .await?;
+                    Ok(())
+                })
+            })
+            .connect(&db_url)
+            .await
+            .expect("connect scoped witness pool");
+        apply_witness_migrations(&pool).await;
+        (admin_pool, pool, schema)
+    }
+
+    /// Signed single-record commit frame for `did` creating `dev_path`.
+    fn signed_device_commit_msg(
+        did: &str,
+        rev: &str,
+        seq: i64,
+        sk: &k256::ecdsa::SigningKey,
+        dev_path: &str,
+        dev_seed: u8,
+    ) -> Arc<SubscribeReposMessage> {
+        let dev_bytes = encode_device_cbor("ed25519", dev_seed, 32);
+        let dev_cid = verify::compute_dagcbor_cid(&dev_bytes);
+        let mut mst_map = BTreeMap::new();
+        mst_map.insert(dev_path.to_string(), dev_cid);
+        let mst_bytes = verify::encode_mst_leaf_cbor(&mst_map);
+        let mst_cid = verify::compute_dagcbor_cid(&mst_bytes);
+        let mst_blocks = vec![(mst_cid, mst_bytes)];
+        let unsigned = verify::encode_unsigned_v3_commit_cbor(did, rev, mst_cid, None);
+        let sig = verify::sign_k256_low_s(sk, &unsigned);
+        let signed = verify::encode_signed_v3_commit_cbor(did, rev, mst_cid, None, sig);
+        let root_cid = verify::compute_dagcbor_cid(&signed);
+        let mut sections = vec![(root_cid, signed)];
+        sections.extend(mst_blocks);
+        sections.push((dev_cid, dev_bytes));
+        let car = verify::encode_car_v1(&[root_cid], &sections);
+        build_subscribe_repos_commit_msg(
+            did,
+            rev,
+            seq,
+            root_cid,
+            car,
+            vec![("create", dev_path, Some(dev_cid))],
+        )
+    }
+
+    #[tokio::test]
+    async fn mailbox_epoch_without_witnessed_predecessor_is_withheld_until_linked() {
+        let mut store = InMemoryWitnessStore::default();
+        let frank = "did:plc:frankunlinked0000000000006";
+
+        // Epoch 1 arrives first: its predecessor was never witnessed.
+        let out1 = evaluate_commit(
+            &mut store,
+            &ObservedCommit {
+                actor_did: frank.to_string(),
+                seq: 10,
+                rev: "3l7ffff000001".to_string(),
+                commit_cid: "bafyfrank1".to_string(),
+                ops: vec![ObservedRepoOp {
+                    action: "create".to_string(),
+                    path: "blue.catbird.labyrinth.mailboxKeys/000000000001".to_string(),
+                    cid: Some("bafyfmk1".to_string()),
+                    block: Some(encode_mailbox_cbor(frank, 1, 0xF1, Some(0xF0))),
+                }],
+            },
+        )
+        .await
+        .unwrap();
+        assert!(out1.anomalies.is_empty());
+        assert_eq!(
+            out1.indexed_mailbox_records, 0,
+            "an epoch with an unwitnessed predecessor must not count as witnessed"
+        );
+        assert_eq!(out1.unverified.len(), 1);
+        assert_eq!(
+            out1.unverified[0].reason,
+            UNVERIFIED_PRIOR_EPOCH_UNWITNESSED
+        );
+        assert_eq!(
+            out1.unverified[0].op_path,
+            "blue.catbird.labyrinth.mailboxKeys/000000000001"
+        );
+        assert_eq!(store.unverified, out1.unverified);
+        let pinned = store
+            .mailbox_epochs
+            .get(&(frank.to_string(), 1))
+            .expect("withheld epoch is still pinned for later split-view checks");
+        assert!(!pinned.chain_verified);
+
+        // Epoch 0 then arrives and links forward: epoch 1's chain is now verified.
+        let out0 = evaluate_commit(
+            &mut store,
+            &ObservedCommit {
+                actor_did: frank.to_string(),
+                seq: 11,
+                rev: "3l7ffff000002".to_string(),
+                commit_cid: "bafyfrank0".to_string(),
+                ops: vec![ObservedRepoOp {
+                    action: "create".to_string(),
+                    path: "blue.catbird.labyrinth.mailboxKeys/000000000000".to_string(),
+                    cid: Some("bafyfmk0".to_string()),
+                    block: Some(encode_mailbox_cbor(frank, 0, 0xF0, None)),
+                }],
+            },
+        )
+        .await
+        .unwrap();
+        assert!(out0.anomalies.is_empty());
+        assert!(out0.unverified.is_empty());
+        assert_eq!(out0.indexed_mailbox_records, 1);
+        assert!(store.mailbox_epochs[&(frank.to_string(), 0)].chain_verified);
+        assert!(
+            store.mailbox_epochs[&(frank.to_string(), 1)].chain_verified,
+            "a verified forward link must mark the later epoch chain-verified"
+        );
+
+        // A later epoch whose predecessor is verified is witnessed normally.
+        let out2 = evaluate_commit(
+            &mut store,
+            &ObservedCommit {
+                actor_did: frank.to_string(),
+                seq: 12,
+                rev: "3l7ffff000003".to_string(),
+                commit_cid: "bafyfrank2".to_string(),
+                ops: vec![ObservedRepoOp {
+                    action: "create".to_string(),
+                    path: "blue.catbird.labyrinth.mailboxKeys/000000000002".to_string(),
+                    cid: Some("bafyfmk2".to_string()),
+                    block: Some(encode_mailbox_cbor(frank, 2, 0xF2, Some(0xF1))),
+                }],
+            },
+        )
+        .await
+        .unwrap();
+        assert!(out2.anomalies.is_empty());
+        assert!(out2.unverified.is_empty());
+        assert_eq!(out2.indexed_mailbox_records, 1);
+        assert_eq!(store.unverified.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn rejected_commits_and_stream_gaps_are_recorded_unverified_in_postgres() {
+        let (admin_pool, pool, schema) = isolated_witness_pool().await;
+
+        let did = "did:plc:gracewithheld000000000007";
+        let real_sk = k256::ecdsa::SigningKey::from_bytes((&[0x91u8; 32]).into()).unwrap();
+        let stale_sk = k256::ecdsa::SigningKey::from_bytes((&[0x92u8; 32]).into()).unwrap();
+        let resolver = Arc::new(StaticAtprotoKeyResolver::new());
+        resolver.insert(
+            did,
+            AtprotoVerifyingKey::Secp256k1(*stale_sk.verifying_key()),
+        );
+        let consumer = WitnessConsumer::with_key_resolver(pool.clone(), resolver.clone());
+
+        // 1) A commit that fails signature verification is withheld, durably.
+        let rejected_path = "blue.catbird.chat.device/3l7gracedev1";
+        let rejected =
+            signed_device_commit_msg(did, "3l7gggg222222", 20, &real_sk, rejected_path, 0x61);
+        let err = consumer
+            .handle_event(rejected)
+            .await
+            .expect_err("wrong #atproto key must still return Err");
+        assert_eq!(
+            err.downcast_ref::<CommitVerifyError>(),
+            Some(&CommitVerifyError::InvalidSignature)
+        );
+        let withheld = db::list_unverified_for_actor(&pool, did).await.unwrap();
+        assert_eq!(
+            withheld.len(),
+            1,
+            "rejected commit must be recorded: {withheld:?}"
+        );
+        assert_eq!(withheld[0].seq, 20);
+        assert_eq!(withheld[0].reason, "invalid_signature");
+        assert_eq!(withheld[0].op_path, COMMIT_LEVEL_OP_PATH);
+        assert_eq!(withheld[0].claimed_paths, vec![rejected_path.to_string()]);
+        let mut tx = pool.begin().await.unwrap();
+        assert!(db::fetch_chat_device(&mut tx, did, "3l7gracedev1")
+            .await
+            .unwrap()
+            .is_none());
+        assert!(db::fetch_actor_head(&mut tx, did).await.unwrap().is_none());
+        tx.commit().await.unwrap();
+
+        // 2) Events dropped by broadcast lag are recorded as a stream gap before the next event.
+        resolver.insert(
+            did,
+            AtprotoVerifyingKey::Secp256k1(*real_sk.verifying_key()),
+        );
+        consumer.handle_lag(7);
+        let accepted_path = "blue.catbird.chat.device/3l7gracedev2";
+        let accepted =
+            signed_device_commit_msg(did, "3l7gggg222223", 30, &real_sk, accepted_path, 0x62);
+        consumer.handle_event(accepted).await.unwrap();
+        let gaps = db::list_stream_gaps(&pool).await.unwrap();
+        assert_eq!(
+            gaps,
+            vec![StreamGapRecord {
+                dropped_events: 7,
+                last_seq_before_gap: Some(20),
+                first_seq_after_gap: Some(30),
+            }]
+        );
+        let mut tx = pool.begin().await.unwrap();
+        assert!(db::fetch_chat_device(&mut tx, did, "3l7gracedev2")
+            .await
+            .unwrap()
+            .is_some());
+        tx.commit().await.unwrap();
+        assert_eq!(
+            db::list_unverified_for_actor(&pool, did)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+
+        let _ = sqlx::query(&format!("DROP SCHEMA IF EXISTS \"{schema}\" CASCADE"))
+            .execute(&admin_pool)
+            .await;
+    }
+
     #[tokio::test]
     async fn propagates_verification_errors_and_retries_did_key_refresh_once() {
         let did = "did:plc:errorprop000000000000001";
@@ -2927,7 +3467,10 @@ mod tests {
             AtprotoVerifyingKey::Secp256k1(*stale_sk.verifying_key()),
         );
 
+        // Unreachable store: verification errors must still propagate when the withheld-commit
+        // record cannot be written.
         let lazy_pool = sqlx::postgres::PgPoolOptions::new()
+            .acquire_timeout(std::time::Duration::from_millis(250))
             .connect_lazy("postgres://unused@127.0.0.1:1/unused")
             .expect("lazy pool");
         let consumer = WitnessConsumer::with_key_resolver(lazy_pool, resolver.clone());
