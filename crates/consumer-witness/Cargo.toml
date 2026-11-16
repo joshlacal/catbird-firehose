@@ -2,6 +2,8 @@
 name = "catbird-firehose-consumer-witness"
 version = "0.1.0"
 edition.workspace = true
+license.workspace = true
+publish.workspace = true
 
 [dependencies]
 catbird-firehose-fanout = { workspace = true }
