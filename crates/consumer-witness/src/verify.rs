@@ -934,8 +934,29 @@ mod cbor_byte_vec {
     }
 }
 
+/// ATProto MST layer of `key`: the number of leading zero 2-bit chunks of `SHA-256(key)`
+/// (fanout 4). Every entry in a node shares one layer and a node's subtrees sit exactly one
+/// layer below it.
+pub fn mst_key_layer(key: &[u8]) -> u32 {
+    let digest = sha2::Sha256::digest(key);
+    let mut layer = 0;
+    for byte in digest {
+        if byte == 0 {
+            layer += 4;
+            continue;
+        }
+        layer += byte.leading_zeros() / 2;
+        break;
+    }
+    layer
+}
+
 /// Walk a canonical ATProto MST rooted at `mst_root_cid` for `target_key`, returning
 /// `Ok(Some(record_cid))` on verified inclusion or `Ok(None)` on verified exclusion.
+///
+/// Every node on the path must be canonical: entries sorted with minimal prefix compression,
+/// all entries on one key layer ([`mst_key_layer`]), each subtree exactly one layer below its
+/// parent, and a root that carries entries unless the tree is empty.
 pub fn verify_mst_key_lookup(
     blocks: &HashMap<Cid, &[u8]>,
     mst_root_cid: Cid,
@@ -946,22 +967,38 @@ pub fn verify_mst_key_lookup(
         blocks,
         mst_root_cid,
         target_key,
-        None,
-        None,
+        MstWalkBounds {
+            lower: None,
+            upper: None,
+            expected_layer: None,
+        },
         &mut visited,
         0,
     )
+}
+
+/// Constraints a parent places on the subtree being walked.
+#[derive(Clone, Copy)]
+struct MstWalkBounds<'a> {
+    lower: Option<&'a [u8]>,
+    upper: Option<&'a [u8]>,
+    /// `None` only at the root, whose layer is taken from its own entries.
+    expected_layer: Option<u32>,
 }
 
 fn walk_mst_node(
     blocks: &HashMap<Cid, &[u8]>,
     node_cid: Cid,
     target_key: &[u8],
-    lower_bound: Option<&[u8]>,
-    upper_bound: Option<&[u8]>,
+    bounds: MstWalkBounds<'_>,
     visited: &mut HashSet<Cid>,
     depth: usize,
 ) -> Result<Option<Cid>, String> {
+    let MstWalkBounds {
+        lower: lower_bound,
+        upper: upper_bound,
+        expected_layer,
+    } = bounds;
     if depth > MST_MAX_DEPTH {
         return Err("MST proof exceeded maximum depth".to_string());
     }
@@ -975,9 +1012,6 @@ fn walk_mst_node(
     verify_canonical_dagcbor(node_bytes)?;
     let node: MstNodeData = serde_ipld_dagcbor::from_slice(node_bytes)
         .map_err(|e| format!("malformed MST node block: {e}"))?;
-    if depth > 0 && node.e.is_empty() {
-        return Err("non-root MST node cannot be empty".to_string());
-    }
 
     let mut keys: Vec<Vec<u8>> = Vec::with_capacity(node.e.len());
     for (idx, entry) in node.e.iter().enumerate() {
@@ -1039,19 +1073,55 @@ fn walk_mst_node(
         }
     }
 
+    // Key-layer canonicality: one layer per node, subtrees exactly one layer down.
+    let node_layer = match keys.first() {
+        Some(first) => {
+            let layer = mst_key_layer(first);
+            if keys.iter().any(|key| mst_key_layer(key) != layer) {
+                return Err("MST node mixes keys from different layers".to_string());
+            }
+            if let Some(expected) = expected_layer {
+                if layer != expected {
+                    return Err(format!(
+                        "MST node layer {layer} does not match expected subtree layer {expected}"
+                    ));
+                }
+            }
+            layer
+        }
+        None => match (expected_layer, node.l) {
+            // Empty repository.
+            (None, None) => return Ok(None),
+            (None, Some(_)) => {
+                return Err("MST root without entries must be trimmed to its subtree".to_string())
+            }
+            (Some(_), None) => return Err("non-root MST node cannot be empty".to_string()),
+            // Entry-less intermediate node on a skipped layer.
+            (Some(layer), Some(_)) => layer,
+        },
+    };
+    let has_subtree = node.l.is_some() || node.e.iter().any(|entry| entry.t.is_some());
+    let child_layer = node_layer.checked_sub(1);
+    if has_subtree && child_layer.is_none() {
+        return Err("layer-0 MST node cannot have subtrees".to_string());
+    }
+
     if keys.is_empty() {
-        return match node.l {
-            Some(left_cid) => walk_mst_node(
-                blocks,
-                left_cid,
-                target_key,
-                lower_bound,
-                upper_bound,
-                visited,
-                depth + 1,
-            ),
-            None => Ok(None),
-        };
+        let left_cid = node
+            .l
+            .expect("entry-less intermediate node has a left subtree");
+        return walk_mst_node(
+            blocks,
+            left_cid,
+            target_key,
+            MstWalkBounds {
+                lower: lower_bound,
+                upper: upper_bound,
+                expected_layer: child_layer,
+            },
+            visited,
+            depth + 1,
+        );
     }
 
     match keys.binary_search_by(|candidate| candidate.as_slice().cmp(target_key)) {
@@ -1061,8 +1131,11 @@ fn walk_mst_node(
                 blocks,
                 left_cid,
                 target_key,
-                lower_bound,
-                Some(keys[0].as_slice()),
+                MstWalkBounds {
+                    lower: lower_bound,
+                    upper: Some(keys[0].as_slice()),
+                    expected_layer: child_layer,
+                },
                 visited,
                 depth + 1,
             ),
@@ -1076,8 +1149,11 @@ fn walk_mst_node(
                     blocks,
                     sub_cid,
                     target_key,
-                    Some(keys[idx].as_slice()),
-                    next_upper,
+                    MstWalkBounds {
+                        lower: Some(keys[idx].as_slice()),
+                        upper: next_upper,
+                        expected_layer: child_layer,
+                    },
                     visited,
                     depth + 1,
                 ),
@@ -1317,12 +1393,91 @@ pub(crate) fn sign_k256_low_s(sk: &k256::ecdsa::SigningKey, msg: &[u8]) -> Vec<u
     sig.normalize_s().unwrap_or(sig).to_bytes().to_vec()
 }
 
+/// One flat MST node holding every record (canonical only for zero or one record, or for
+/// records that all share one layer).
 #[cfg(test)]
 pub(crate) fn encode_mst_leaf_cbor(sorted_records: &BTreeMap<String, Cid>) -> Vec<u8> {
-    let mut entries = Vec::with_capacity(sorted_records.len());
+    let entries: Vec<(&[u8], Cid, Option<Cid>)> = sorted_records
+        .iter()
+        .map(|(path, cid)| (path.as_bytes(), *cid, None))
+        .collect();
+    encode_mst_node_cbor(None, &entries)
+}
+
+/// Canonical ATProto MST over `records`: returns the root CID and every node block. Builds
+/// the same shape as the reference implementation, including entry-less intermediate nodes
+/// when a layer is skipped.
+#[cfg(test)]
+pub(crate) fn encode_canonical_mst(records: &BTreeMap<String, Cid>) -> (Cid, Vec<(Cid, Vec<u8>)>) {
+    let items: Vec<(&[u8], Cid)> = records
+        .iter()
+        .map(|(path, cid)| (path.as_bytes(), *cid))
+        .collect();
+    let root_layer = items
+        .iter()
+        .map(|(key, _)| mst_key_layer(key))
+        .max()
+        .unwrap_or(0);
+    let mut blocks = Vec::new();
+    let root = build_canonical_mst_node(&items, root_layer, &mut blocks);
+    (root, blocks)
+}
+
+#[cfg(test)]
+fn build_canonical_mst_node(
+    items: &[(&[u8], Cid)],
+    layer: u32,
+    blocks: &mut Vec<(Cid, Vec<u8>)>,
+) -> Cid {
+    let mut left = None;
+    let mut entries: Vec<(&[u8], Cid, Option<Cid>)> = Vec::new();
+    let mut group: Vec<(&[u8], Cid)> = Vec::new();
+    for &(key, cid) in items {
+        if mst_key_layer(key) == layer {
+            attach_canonical_subtree(&mut group, layer, &mut left, &mut entries, blocks);
+            entries.push((key, cid, None));
+        } else {
+            group.push((key, cid));
+        }
+    }
+    attach_canonical_subtree(&mut group, layer, &mut left, &mut entries, blocks);
+    let bytes = encode_mst_node_cbor(left, &entries);
+    let cid = compute_dagcbor_cid(&bytes);
+    blocks.push((cid, bytes));
+    cid
+}
+
+/// Build `group` (keys strictly between two entries of a layer-`layer` node) as the subtree
+/// left of the next entry, or as the node's `l` pointer when no entry precedes it.
+#[cfg(test)]
+fn attach_canonical_subtree<'k>(
+    group: &mut Vec<(&'k [u8], Cid)>,
+    layer: u32,
+    left: &mut Option<Cid>,
+    entries: &mut [(&'k [u8], Cid, Option<Cid>)],
+    blocks: &mut Vec<(Cid, Vec<u8>)>,
+) {
+    if group.is_empty() {
+        return;
+    }
+    let child_layer = layer.checked_sub(1).expect("MST keys below layer 0");
+    let child = build_canonical_mst_node(group, child_layer, blocks);
+    match entries.last_mut() {
+        Some(last) => last.2 = Some(child),
+        None => *left = Some(child),
+    }
+    group.clear();
+}
+
+/// Encode one MST node (`l` + prefix-compressed `e`) as DAG-CBOR.
+#[cfg(test)]
+pub(crate) fn encode_mst_node_cbor(
+    left: Option<Cid>,
+    sorted: &[(&[u8], Cid, Option<Cid>)],
+) -> Vec<u8> {
+    let mut entries = Vec::with_capacity(sorted.len());
     let mut prev_key: Option<&[u8]> = None;
-    for (path, cid) in sorted_records {
-        let key_bytes = path.as_bytes();
+    for &(key_bytes, cid, subtree) in sorted {
         let prefix_len = match prev_key {
             None => 0usize,
             Some(prev) => prev
@@ -1335,13 +1490,13 @@ pub(crate) fn encode_mst_leaf_cbor(sorted_records: &BTreeMap<String, Cid>) -> Ve
         let mut entry_map = BTreeMap::new();
         entry_map.insert("p".to_string(), Ipld::Integer(prefix_len as i128));
         entry_map.insert("k".to_string(), Ipld::Bytes(suffix));
-        entry_map.insert("v".to_string(), Ipld::Link(*cid));
-        entry_map.insert("t".to_string(), Ipld::Null);
+        entry_map.insert("v".to_string(), Ipld::Link(cid));
+        entry_map.insert("t".to_string(), subtree.map_or(Ipld::Null, Ipld::Link));
         entries.push(Ipld::Map(entry_map));
         prev_key = Some(key_bytes);
     }
     let mut node_map = BTreeMap::new();
-    node_map.insert("l".to_string(), Ipld::Null);
+    node_map.insert("l".to_string(), left.map_or(Ipld::Null, Ipld::Link));
     node_map.insert("e".to_string(), Ipld::List(entries));
     serde_ipld_dagcbor::to_vec(&Ipld::Map(node_map)).expect("encode MST leaf")
 }

@@ -3256,9 +3256,7 @@ mod tests {
         let dev_cid = verify::compute_dagcbor_cid(&dev_bytes);
         let mut mst_map = BTreeMap::new();
         mst_map.insert(dev_path.to_string(), dev_cid);
-        let mst_bytes = verify::encode_mst_leaf_cbor(&mst_map);
-        let mst_cid = verify::compute_dagcbor_cid(&mst_bytes);
-        let mst_blocks = vec![(mst_cid, mst_bytes)];
+        let (mst_cid, mst_blocks) = verify::encode_canonical_mst(&mst_map);
         let unsigned = verify::encode_unsigned_v3_commit_cbor(did, rev, mst_cid, None);
         let sig = verify::sign_k256_low_s(sk, &unsigned);
         let signed = verify::encode_signed_v3_commit_cbor(did, rev, mst_cid, None, sig);
@@ -3452,6 +3450,245 @@ mod tests {
         let _ = sqlx::query(&format!("DROP SCHEMA IF EXISTS \"{schema}\" CASCADE"))
             .execute(&admin_pool)
             .await;
+    }
+
+    /// Deterministic record keys and their MST layers.
+    fn mst_candidate_keys(count: usize) -> Vec<(String, u32)> {
+        (0..count)
+            .map(|i| {
+                let key = format!("blue.catbird.chat.device/3l7mst{i:05}");
+                let layer = verify::mst_key_layer(key.as_bytes());
+                (key, layer)
+            })
+            .collect()
+    }
+
+    fn record_cid_for(key: &str) -> Cid {
+        verify::compute_dagcbor_cid(
+            &serde_ipld_dagcbor::to_vec(&Ipld::String(key.to_string())).unwrap(),
+        )
+    }
+
+    #[test]
+    fn mst_key_layer_counts_leading_zero_bit_pairs_of_sha256() {
+        // Reference vectors from the ATProto MST specification and reference implementation.
+        assert_eq!(verify::mst_key_layer(b"2653ae71"), 0);
+        assert_eq!(verify::mst_key_layer(b"blue"), 1);
+        assert_eq!(verify::mst_key_layer(b"88bfafc7"), 2);
+        assert_eq!(verify::mst_key_layer(b"2a92d355"), 4);
+        assert_eq!(verify::mst_key_layer(b"884976f5"), 6);
+        assert_eq!(verify::mst_key_layer(b"app.bsky.feed.post/454397e440ec"), 4);
+        assert_eq!(verify::mst_key_layer(b"app.bsky.feed.post/9adeb165882c"), 8);
+    }
+
+    #[tokio::test]
+    async fn mst_proofs_descend_multi_level_trees_for_inclusion_and_exclusion() {
+        // The first 61 candidate keys, minus layers above 2 and every third layer-0 key, form a
+        // three-level tree: four layer-2 root entries, layer-1 nodes (some entry-less, where a
+        // gap holds only layer-0 keys) and layer-0 leaves. Every other candidate is absent.
+        let candidates = mst_candidate_keys(4_000);
+        let mut present = BTreeMap::new();
+        let mut absent = Vec::new();
+        let (mut top, mut mid, mut low, mut zeros_seen) = (0, 0, 0, 0);
+        for (idx, (key, layer)) in candidates.iter().enumerate() {
+            let take = idx <= 60
+                && match layer {
+                    2 => {
+                        top += 1;
+                        true
+                    }
+                    1 => {
+                        mid += 1;
+                        true
+                    }
+                    0 => {
+                        zeros_seen += 1;
+                        let take = zeros_seen % 3 != 0;
+                        low += usize::from(take);
+                        take
+                    }
+                    _ => false,
+                };
+            if take {
+                present.insert(key.clone(), record_cid_for(key));
+            } else {
+                absent.push(key.clone());
+            }
+        }
+        assert_eq!(top, 4, "fixture needs four layer-2 keys");
+        assert!(mid >= 4, "fixture needs layer-1 keys");
+        assert!(low >= 20, "fixture needs layer-0 keys under every subtree");
+
+        let (root_cid, nodes) = verify::encode_canonical_mst(&present);
+        assert!(nodes.len() >= 4, "fixture must be a multi-level tree");
+        let blocks: HashMap<Cid, &[u8]> = nodes
+            .iter()
+            .map(|(cid, bytes)| (*cid, bytes.as_slice()))
+            .collect();
+        let root: Ipld = serde_ipld_dagcbor::from_slice(blocks[&root_cid]).unwrap();
+        let Ipld::Map(root_map) = &root else {
+            panic!("root node is a map")
+        };
+        assert!(
+            matches!(root_map.get("l"), Some(Ipld::Link(_))),
+            "root must have a left subtree"
+        );
+        let Some(Ipld::List(root_entries)) = root_map.get("e") else {
+            panic!("root has entries")
+        };
+        assert_eq!(root_entries.len(), 4, "the layer-2 keys sit at the root");
+        assert!(
+            root_entries
+                .iter()
+                .all(|e| matches!(e, Ipld::Map(m) if matches!(m.get("t"), Some(Ipld::Link(_))))),
+            "every root entry must have a right subtree"
+        );
+
+        for (key, cid) in &present {
+            assert_eq!(
+                verify::verify_mst_key_lookup(&blocks, root_cid, key.as_bytes()),
+                Ok(Some(*cid)),
+                "inclusion of {key}"
+            );
+        }
+        let before_all = "blue.catbird.chat.device/3l7mst";
+        let after_all = "blue.catbird.chat.device/3l7mstzzzzz";
+        for key in absent
+            .iter()
+            .map(String::as_str)
+            .chain([before_all, after_all])
+        {
+            assert_eq!(
+                verify::verify_mst_key_lookup(&blocks, root_cid, key.as_bytes()),
+                Ok(None),
+                "exclusion of {key}"
+            );
+        }
+
+        // The same tree authenticates create and delete ops end to end.
+        let did = "did:plc:mstmultilevel00000000008";
+        let rev = "3l7mmmm222222";
+        let sk = k256::ecdsa::SigningKey::from_bytes((&[0xA7u8; 32]).into()).unwrap();
+        let resolver = Arc::new(StaticAtprotoKeyResolver::new());
+        resolver.insert(did, AtprotoVerifyingKey::Secp256k1(*sk.verifying_key()));
+        let consumer = WitnessConsumer::with_key_resolver(
+            sqlx::postgres::PgPoolOptions::new()
+                .connect_lazy("postgres://unused@127.0.0.1:1/unused")
+                .expect("lazy pool"),
+            resolver,
+        );
+        let dev_path = present
+            .keys()
+            .find(|k| verify::mst_key_layer(k.as_bytes()) == 0)
+            .cloned()
+            .expect("layer-0 key");
+        let dev_bytes = encode_device_cbor("ed25519", 0x5A, 32);
+        let dev_cid = verify::compute_dagcbor_cid(&dev_bytes);
+        let mut records = present.clone();
+        records.insert(dev_path.clone(), dev_cid);
+        let (mst_cid, mst_nodes) = verify::encode_canonical_mst(&records);
+        let unsigned = verify::encode_unsigned_v3_commit_cbor(did, rev, mst_cid, None);
+        let sig = verify::sign_k256_low_s(&sk, &unsigned);
+        let signed = verify::encode_signed_v3_commit_cbor(did, rev, mst_cid, None, sig);
+        let commit_cid = verify::compute_dagcbor_cid(&signed);
+        let mut sections = vec![(commit_cid, signed)];
+        sections.extend(mst_nodes);
+        sections.push((dev_cid, dev_bytes));
+        let car = verify::encode_car_v1(&[commit_cid], &sections);
+        let deleted_path = absent
+            .iter()
+            .find(|k| verify::mst_key_layer(k.as_bytes()) == 0)
+            .expect("absent layer-0 key");
+        let msg = build_subscribe_repos_commit_msg(
+            did,
+            rev,
+            40,
+            commit_cid,
+            car,
+            vec![
+                ("create", dev_path.as_str(), Some(dev_cid)),
+                ("delete", deleted_path.as_str(), None),
+            ],
+        );
+        let SubscribeReposMessage::Commit(frame) = msg.as_ref() else {
+            panic!("commit frame")
+        };
+        let observed = consumer
+            .verify_and_extract_observed_commit(frame)
+            .await
+            .expect("multi-level MST proof verifies");
+        assert_eq!(observed.ops.len(), 2);
+    }
+
+    #[test]
+    fn mst_proofs_reject_nodes_on_the_wrong_layer() {
+        let candidates = mst_candidate_keys(4_000);
+        let on_layer = |layer: u32| -> Vec<String> {
+            candidates
+                .iter()
+                .filter(|(_, l)| *l == layer)
+                .map(|(k, _)| k.clone())
+                .collect()
+        };
+        let l0 = on_layer(0);
+        let l1 = on_layer(1);
+        let lookup = |nodes: &[(Cid, Vec<u8>)], root: Cid, key: &str| {
+            let blocks: HashMap<Cid, &[u8]> = nodes
+                .iter()
+                .map(|(cid, bytes)| (*cid, bytes.as_slice()))
+                .collect();
+            verify::verify_mst_key_lookup(&blocks, root, key.as_bytes())
+        };
+        let node = |left: Option<Cid>, entries: &[(&str, Option<Cid>)]| {
+            let mut sorted: Vec<(&[u8], Cid, Option<Cid>)> = entries
+                .iter()
+                .map(|(k, t)| (k.as_bytes(), record_cid_for(k), *t))
+                .collect();
+            sorted.sort_by(|a, b| a.0.cmp(b.0));
+            let bytes = verify::encode_mst_node_cbor(left, &sorted);
+            (verify::compute_dagcbor_cid(&bytes), bytes)
+        };
+
+        // 1) One node mixing a layer-0 and a layer-1 key.
+        let (lo, hi) = if l0[0] < l1[0] {
+            (&l0[0], &l1[0])
+        } else {
+            (&l1[0], &l0[0])
+        };
+        let mixed = node(None, &[(lo, None), (hi, None)]);
+        for key in [lo, hi] {
+            let err = lookup(std::slice::from_ref(&mixed), mixed.0, key)
+                .expect_err("node mixing key layers must be rejected");
+            assert!(err.contains("layer"), "{err}");
+        }
+
+        // 2) Layer-1 root whose left subtree holds a layer-1 key instead of layer-0 keys.
+        let mut ones = l1.clone();
+        ones.sort();
+        let (child_key, root_key) = (&ones[0], &ones[1]);
+        let child = node(None, &[(child_key, None)]);
+        let root = node(Some(child.0), &[(root_key, None)]);
+        let err = lookup(&[child.clone(), root.clone()], root.0, child_key)
+            .expect_err("subtree on the parent's layer must be rejected");
+        assert!(err.contains("layer"), "{err}");
+
+        // 3) Layer-0 node with a subtree pointer.
+        let mut zeros = l0.clone();
+        zeros.sort();
+        let leaf = node(None, &[(&zeros[1], None)]);
+        let bad_leaf_parent = node(None, &[(&zeros[0], Some(leaf.0))]);
+        let err = lookup(
+            &[leaf, bad_leaf_parent.clone()],
+            bad_leaf_parent.0,
+            &zeros[1],
+        )
+        .expect_err("layer-0 node cannot have subtrees");
+        assert!(err.contains("layer"), "{err}");
+
+        // 4) Root with no entries that only points at a subtree is not trimmed, so not canonical.
+        let inner = node(None, &[(&zeros[0], None)]);
+        let untrimmed = node(Some(inner.0), &[]);
+        assert!(lookup(&[inner, untrimmed.clone()], untrimmed.0, &zeros[0]).is_err());
     }
 
     #[tokio::test]
