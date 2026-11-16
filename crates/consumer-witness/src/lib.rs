@@ -20,7 +20,7 @@ pub use verify::{
     P256_MULTICODEC_PREFIX, SECP256K1_MULTICODEC_PREFIX,
 };
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::io::Cursor;
 use std::sync::{
     atomic::{AtomicI64, AtomicU64, Ordering},
@@ -195,7 +195,10 @@ pub struct UnverifiedCommitRecord {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StreamGapRecord {
     pub dropped_events: u64,
+    /// `None`: no sequenced event had been seen yet, so the gap is open below.
     pub last_seq_before_gap: Option<i64>,
+    /// Seq of the next event that carried one. `None` means the range is open-ended above:
+    /// treat everything after `last_seq_before_gap` as unverified.
     pub first_seq_after_gap: Option<i64>,
 }
 
@@ -1428,13 +1431,19 @@ pub struct WitnessConsumer {
     db_pool: Pool<Postgres>,
     key_resolver: Arc<dyn AtprotoKeyResolver>,
     verification_failures: AtomicU64,
-    /// Last `#commit` seq received, `NO_SEQ` before the first one.
+    /// Last relay seq received on any message type, `NO_SEQ` before the first one.
     last_seq: AtomicI64,
     /// Events dropped by broadcast lag and not yet written to `witness_stream_gaps`.
     pending_gap: Mutex<Option<PendingGap>>,
+    /// Withheld-commit verdicts whose write to `witness_unverified_commits` failed, retried
+    /// before each later event. Bounded by [`MAX_PENDING_UNVERIFIED`].
+    pending_unverified: Mutex<VecDeque<UnverifiedCommitRecord>>,
 }
 
 const NO_SEQ: i64 = i64::MIN;
+/// Withheld-commit verdicts held in memory while the store is unavailable. Past this the
+/// oldest is dropped and counted under the `pending_queue_overflow` reason.
+const MAX_PENDING_UNVERIFIED: usize = 10_000;
 
 #[derive(Debug, Clone, Copy)]
 struct PendingGap {
@@ -1457,6 +1466,65 @@ impl WitnessConsumer {
             verification_failures: AtomicU64::new(0),
             last_seq: AtomicI64::new(NO_SEQ),
             pending_gap: Mutex::new(None),
+            pending_unverified: Mutex::new(VecDeque::new()),
+        }
+    }
+
+    fn queue_unverified(&self, rec: UnverifiedCommitRecord) {
+        let mut pending = self
+            .pending_unverified
+            .lock()
+            .expect("pending unverified lock");
+        if pending.len() >= MAX_PENDING_UNVERIFIED {
+            if let Some(dropped) = pending.pop_front() {
+                metrics::WITNESS_UNVERIFIED_RECORDED
+                    .with_label_values(&["pending_queue_overflow"])
+                    .inc();
+                tracing::error!(
+                    actor_did = %dropped.actor_did,
+                    seq = dropped.seq,
+                    reason = %dropped.reason,
+                    "Dropped a withheld-commit verdict that could not be stored"
+                );
+            }
+        }
+        pending.push_back(rec);
+    }
+
+    /// Write withheld-commit verdicts whose earlier write failed. Stops at the first failure
+    /// and keeps the rest, in order, for the next event.
+    async fn flush_pending_unverified(&self) {
+        loop {
+            let Some(rec) = self
+                .pending_unverified
+                .lock()
+                .expect("pending unverified lock")
+                .pop_front()
+            else {
+                return;
+            };
+            match db::insert_unverified_commit(&self.db_pool, &rec).await {
+                Ok(inserted) => {
+                    if inserted {
+                        metrics::WITNESS_UNVERIFIED_RECORDED
+                            .with_label_values(&[rec.reason.as_str()])
+                            .inc();
+                    }
+                }
+                Err(err) => {
+                    warn!(
+                        actor_did = %rec.actor_did,
+                        seq = rec.seq,
+                        error = %err,
+                        "Still unable to record withheld transparency commit; will retry"
+                    );
+                    self.pending_unverified
+                        .lock()
+                        .expect("pending unverified lock")
+                        .push_front(rec);
+                    return;
+                }
+            }
         }
     }
 
@@ -1534,13 +1602,16 @@ impl WitnessConsumer {
                         .inc();
                 }
             }
-            Err(err) => warn!(
-                actor_did = %rec.actor_did,
-                seq = rec.seq,
-                reason,
-                error = %err,
-                "Failed to record withheld transparency commit"
-            ),
+            Err(err) => {
+                warn!(
+                    actor_did = %rec.actor_did,
+                    seq = rec.seq,
+                    reason,
+                    error = %err,
+                    "Failed to record withheld transparency commit; will retry"
+                );
+                self.queue_unverified(rec);
+            }
         }
     }
 
@@ -1873,6 +1944,18 @@ fn parse_bounded_car_v1_blocks(car_bytes: &[u8]) -> Result<HashMap<Cid, &[u8]>, 
     parse_bounded_car_v1(car_bytes).map(|(_roots, blocks)| blocks)
 }
 
+/// Relay sequence number of any firehose message that carries one (`#info` and unknown
+/// message types do not).
+fn message_seq(msg: &SubscribeReposMessage) -> Option<i64> {
+    match msg {
+        SubscribeReposMessage::Commit(m) => Some(m.seq),
+        SubscribeReposMessage::Sync(m) => Some(m.seq),
+        SubscribeReposMessage::Identity(m) => Some(m.seq),
+        SubscribeReposMessage::Account(m) => Some(m.seq),
+        _ => None,
+    }
+}
+
 impl Consumer for WitnessConsumer {
     fn name(&self) -> &str {
         "device-key-transparency-witness"
@@ -1900,14 +1983,14 @@ impl Consumer for WitnessConsumer {
     }
 
     async fn handle_event(&self, event: Arc<SubscribeReposMessage>) -> Result<()> {
-        let seq = match event.as_ref() {
-            SubscribeReposMessage::Commit(commit) => Some(commit.seq),
-            _ => None,
-        };
-        self.flush_pending_gap(seq).await;
+        let seq = message_seq(event.as_ref());
+        // A gap stays open until a message that carries a seq arrives, so its upper bound is
+        // recorded whenever the relay provides one.
         if let Some(seq) = seq {
+            self.flush_pending_gap(Some(seq)).await;
             self.last_seq.store(seq, Ordering::Release);
         }
+        self.flush_pending_unverified().await;
 
         let SubscribeReposMessage::Commit(commit) = event.as_ref() else {
             return Ok(());
@@ -3779,6 +3862,84 @@ mod tests {
                 .len(),
             1
         );
+
+        let _ = sqlx::query(&format!("DROP SCHEMA IF EXISTS \"{schema}\" CASCADE"))
+            .execute(&admin_pool)
+            .await;
+    }
+
+    fn identity_msg(did: &str, seq: i64) -> Arc<SubscribeReposMessage> {
+        use jacquard_common::IntoStatic as _;
+
+        let mut map = BTreeMap::new();
+        map.insert("did".to_string(), Ipld::String(did.to_string()));
+        map.insert("seq".to_string(), Ipld::Integer(seq as i128));
+        map.insert(
+            "time".to_string(),
+            Ipld::String("2026-11-16T12:00:00Z".to_string()),
+        );
+        let raw = serde_ipld_dagcbor::to_vec(&Ipld::Map(map)).unwrap();
+        let identity: jacquard_api::com_atproto::sync::subscribe_repos::Identity =
+            serde_ipld_dagcbor::from_slice(&raw).unwrap();
+        Arc::new(SubscribeReposMessage::Identity(Box::new(
+            identity.into_static(),
+        )))
+    }
+
+    #[tokio::test]
+    async fn stream_gaps_close_on_any_sequenced_event_and_withheld_commits_survive_store_errors() {
+        let (admin_pool, pool, schema) = isolated_witness_pool().await;
+
+        let did = "did:plc:jackretrywithheld00000010";
+        let real_sk = k256::ecdsa::SigningKey::from_bytes((&[0xA1u8; 32]).into()).unwrap();
+        let stale_sk = k256::ecdsa::SigningKey::from_bytes((&[0xA2u8; 32]).into()).unwrap();
+        let resolver = Arc::new(StaticAtprotoKeyResolver::new());
+        resolver.insert(
+            did,
+            AtprotoVerifyingKey::Secp256k1(*stale_sk.verifying_key()),
+        );
+        let consumer = WitnessConsumer::with_key_resolver(pool.clone(), resolver.clone());
+
+        // The withheld-commit table is briefly unavailable when a commit is rejected.
+        sqlx::query("ALTER TABLE witness_unverified_commits RENAME TO witness_unverified_away")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let rejected_path = "blue.catbird.chat.device/3l7jackdev01";
+        let rejected =
+            signed_device_commit_msg(did, "3l7jjjj422222", 40, &real_sk, rejected_path, 0x71);
+        consumer
+            .handle_event(rejected)
+            .await
+            .expect_err("wrong #atproto key must still return Err");
+        sqlx::query("ALTER TABLE witness_unverified_away RENAME TO witness_unverified_commits")
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        // A lag gap followed by a non-commit event that carries a seq.
+        consumer.handle_lag(3);
+        consumer.handle_event(identity_msg(did, 45)).await.unwrap();
+
+        let gaps = db::list_stream_gaps(&pool).await.unwrap();
+        assert_eq!(
+            gaps,
+            vec![StreamGapRecord {
+                dropped_events: 3,
+                last_seq_before_gap: Some(40),
+                first_seq_after_gap: Some(45),
+            }],
+            "the gap must close at the next event's seq, whatever its type"
+        );
+        let withheld = db::list_unverified_for_actor(&pool, did).await.unwrap();
+        assert_eq!(
+            withheld.len(),
+            1,
+            "a withheld commit whose first write failed must be written later: {withheld:?}"
+        );
+        assert_eq!(withheld[0].seq, 40);
+        assert_eq!(withheld[0].reason, "invalid_signature");
+        assert_eq!(withheld[0].claimed_paths, vec![rejected_path.to_string()]);
 
         let _ = sqlx::query(&format!("DROP SCHEMA IF EXISTS \"{schema}\" CASCADE"))
             .execute(&admin_pool)

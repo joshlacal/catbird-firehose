@@ -29,7 +29,7 @@ CREATE INDEX idx_witness_unverified_commits_reason
 
 -- Firehose events dropped before reaching the witness (broadcast lag). Every
 -- actor's transparency state is unverified across [last_seq_before_gap,
--- first_seq_after_gap].
+-- first_seq_after_gap]. A NULL bound means the range is open on that side.
 CREATE TABLE witness_stream_gaps (
     id BIGSERIAL PRIMARY KEY,
     dropped_events BIGINT NOT NULL,
