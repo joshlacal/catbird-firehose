@@ -231,6 +231,22 @@ pub async fn mark_mailbox_epoch_chain_verified(
     .bind(epoch_number)
     .execute(&mut **tx)
     .await?;
+    sqlx::query(
+        r#"
+        UPDATE witness_mailbox_heads AS h
+        SET current_epoch_chain_verified = TRUE
+        FROM witness_mailbox_epochs AS e
+        WHERE h.actor_did = $1
+          AND h.current_epoch_number = $2
+          AND e.actor_did = h.actor_did
+          AND e.epoch_number = h.current_epoch_number
+          AND e.epoch_head = h.current_epoch_head
+        "#,
+    )
+    .bind(actor_did)
+    .bind(epoch_number)
+    .execute(&mut **tx)
+    .await?;
     Ok(())
 }
 
@@ -240,7 +256,8 @@ pub async fn fetch_mailbox_head(
 ) -> Result<Option<MailboxHeadRecord>> {
     let row = sqlx::query(
         r#"
-        SELECT current_epoch_number, current_epoch_head, current_record_cid, last_seen_seq, last_seen_rev
+        SELECT current_epoch_number, current_epoch_head, current_record_cid, last_seen_seq, last_seen_rev,
+               current_epoch_chain_verified
         FROM witness_mailbox_heads
         WHERE actor_did = $1
         "#,
@@ -255,6 +272,7 @@ pub async fn fetch_mailbox_head(
         current_record_cid: r.get("current_record_cid"),
         last_seen_seq: r.get("last_seen_seq"),
         last_seen_rev: r.get("last_seen_rev"),
+        current_epoch_chain_verified: r.get("current_epoch_chain_verified"),
     }))
 }
 
@@ -267,15 +285,16 @@ pub async fn upsert_mailbox_head(
         r#"
         INSERT INTO witness_mailbox_heads (
             actor_did, current_epoch_number, current_epoch_head, current_record_cid,
-            last_seen_seq, last_seen_rev, updated_at
+            last_seen_seq, last_seen_rev, current_epoch_chain_verified, updated_at
         )
-        VALUES ($1, $2, $3, $4, $5, $6, NOW())
+        VALUES ($1, $2, $3, $4, $5, $6, $7, NOW())
         ON CONFLICT (actor_did) DO UPDATE
         SET current_epoch_number = EXCLUDED.current_epoch_number,
             current_epoch_head = EXCLUDED.current_epoch_head,
             current_record_cid = EXCLUDED.current_record_cid,
             last_seen_seq = EXCLUDED.last_seen_seq,
             last_seen_rev = EXCLUDED.last_seen_rev,
+            current_epoch_chain_verified = EXCLUDED.current_epoch_chain_verified,
             updated_at = NOW()
         "#,
     )
@@ -285,6 +304,7 @@ pub async fn upsert_mailbox_head(
     .bind(&head.current_record_cid)
     .bind(head.last_seen_seq)
     .bind(&head.last_seen_rev)
+    .bind(head.current_epoch_chain_verified)
     .execute(&mut **tx)
     .await?;
     Ok(())

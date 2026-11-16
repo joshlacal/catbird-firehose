@@ -41,19 +41,44 @@ CREATE TABLE witness_stream_gaps (
 CREATE INDEX idx_witness_stream_gaps_detected
     ON witness_stream_gaps (detected_at DESC);
 
--- TRUE only when previousEpochHead and prevSig were checked against a witnessed
--- predecessor epoch (or the epoch is 0). Existing rows are backfilled from the
--- witnessed predecessor they link to; anything else stays unverified.
+-- TRUE only when every link from epoch 0 up to this epoch was witnessed and
+-- checked (previousEpochHead and prevSig against a chain-verified predecessor).
+-- Epoch 0 is the anchor. Existing rows are backfilled by walking forward from
+-- epoch 0 while each next epoch's previousEpochHead matches its predecessor's
+-- head; the witness stores an epoch next to a pinned neighbour only after the
+-- prevSig on that link verified. Anything past a missing epoch stays unverified
+-- until the witness sees the missing link.
 ALTER TABLE witness_mailbox_epochs
     ADD COLUMN chain_verified BOOLEAN NOT NULL DEFAULT FALSE;
 
-UPDATE witness_mailbox_epochs AS cur
+WITH RECURSIVE verified_chain AS (
+    SELECT actor_did, epoch_number, epoch_head
+    FROM witness_mailbox_epochs
+    WHERE epoch_number = 0
+      AND previous_epoch_head IS NULL
+    UNION ALL
+    SELECT cur.actor_did, cur.epoch_number, cur.epoch_head
+    FROM witness_mailbox_epochs AS cur
+    JOIN verified_chain AS prev
+      ON prev.actor_did = cur.actor_did
+     AND cur.epoch_number = prev.epoch_number + 1
+     AND cur.previous_epoch_head = prev.epoch_head
+)
+UPDATE witness_mailbox_epochs AS e
 SET chain_verified = TRUE
-WHERE cur.epoch_number = 0
-   OR EXISTS (
-        SELECT 1
-        FROM witness_mailbox_epochs AS prev
-        WHERE prev.actor_did = cur.actor_did
-          AND prev.epoch_number = cur.epoch_number - 1
-          AND prev.epoch_head = cur.previous_epoch_head
-   );
+FROM verified_chain AS v
+WHERE e.actor_did = v.actor_did
+  AND e.epoch_number = v.epoch_number;
+
+-- Chain verdict of the epoch the `self` head points at. A head on an
+-- unverified epoch is the latest observed pointer, not a witnessed one.
+ALTER TABLE witness_mailbox_heads
+    ADD COLUMN current_epoch_chain_verified BOOLEAN NOT NULL DEFAULT FALSE;
+
+UPDATE witness_mailbox_heads AS h
+SET current_epoch_chain_verified = TRUE
+FROM witness_mailbox_epochs AS e
+WHERE e.actor_did = h.actor_did
+  AND e.epoch_number = h.current_epoch_number
+  AND e.epoch_head = h.current_epoch_head
+  AND e.chain_verified;

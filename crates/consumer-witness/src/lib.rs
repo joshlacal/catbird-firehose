@@ -39,7 +39,7 @@ use ipld_core::{
 use jacquard_api::com_atproto::sync::subscribe_repos::SubscribeReposMessage;
 use sha2::{Digest, Sha256};
 use sqlx::{Pool, Postgres};
-use tracing::warn;
+use tracing::{info, warn};
 
 pub const CHAT_DEVICE_COLLECTION: &str = "blue.catbird.chat.device";
 pub const MAILBOX_KEYS_COLLECTION: &str = "blue.catbird.labyrinth.mailboxKeys";
@@ -121,9 +121,11 @@ pub struct MailboxEpochRecord {
     pub prev_sig: Option<Vec<u8>>,
     pub backend: Option<String>,
     pub immutable_pinned: bool,
-    /// `true` only when `previousEpochHead` and `prevSig` were checked against a witnessed
-    /// predecessor epoch, or the epoch is 0. An epoch whose predecessor was never witnessed is
-    /// stored so later epochs can link to it, but it is not counted as witnessed.
+    /// `true` only when every link from epoch 0 up to this epoch was witnessed and checked
+    /// (`previousEpochHead` and `prevSig` against the predecessor, which is itself
+    /// chain-verified). Epoch 0 is the anchor. An epoch with any missing or unverified
+    /// predecessor is stored so later epochs can link to it, but it is not counted as
+    /// witnessed; it is upgraded once the missing links arrive and check out.
     pub chain_verified: bool,
     pub first_seen_seq: i64,
     pub first_seen_rev: String,
@@ -150,6 +152,10 @@ pub struct MailboxHeadRecord {
     pub current_record_cid: String,
     pub last_seen_seq: i64,
     pub last_seen_rev: String,
+    /// Chain verdict of the epoch this head points at (see
+    /// [`MailboxEpochRecord::chain_verified`]). A head on an unverified epoch is the latest
+    /// observed pointer, not a witnessed one.
+    pub current_epoch_chain_verified: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -609,6 +615,13 @@ impl WitnessStore for InMemoryWitnessStore {
             .get_mut(&(actor_did.to_string(), epoch_number))
         {
             existing.chain_verified = true;
+            if let Some(head) = self.mailbox_heads.get_mut(actor_did) {
+                if head.current_epoch_number == epoch_number
+                    && head.current_epoch_head == existing.epoch_head
+                {
+                    head.current_epoch_chain_verified = true;
+                }
+            }
         }
         Ok(())
     }
@@ -1167,7 +1180,8 @@ async fn evaluate_mailbox_keys_op<S: WitnessStore>(
                     .await?;
                     return Ok(());
                 }
-                parsed.chain_verified = true;
+                // The link to N-1 holds; the chain is verified only if N-1's own chain is.
+                parsed.chain_verified |= prior_epoch.chain_verified;
             }
         }
     }
@@ -1226,11 +1240,8 @@ async fn evaluate_mailbox_keys_op<S: WitnessStore>(
                 .await?;
                 return Ok(());
             }
-            if !next_epoch.chain_verified {
-                store
-                    .mark_mailbox_epoch_chain_verified(&commit.actor_did, next_epoch_num)
-                    .await?;
-            }
+            // Upgrading N+1 (and later epochs) happens after this epoch is stored, and only
+            // when this epoch's own chain is verified.
         }
     }
 
@@ -1318,10 +1329,15 @@ async fn evaluate_mailbox_keys_op<S: WitnessStore>(
                         current_record_cid: parsed.record_cid.clone(),
                         last_seen_seq: commit.seq,
                         last_seen_rev: commit.rev.clone(),
+                        current_epoch_chain_verified: parsed.chain_verified,
                     },
                 )
                 .await?;
         }
+    }
+
+    if parsed.chain_verified {
+        propagate_chain_verified(store, &commit.actor_did, &parsed).await?;
     }
 
     if parsed.chain_verified {
@@ -1341,7 +1357,7 @@ async fn evaluate_mailbox_keys_op<S: WitnessStore>(
                 claimed_paths: vec![op.path.clone()],
                 reason: UNVERIFIED_PRIOR_EPOCH_UNWITNESSED.to_string(),
                 detail: format!(
-                    "epoch {} predecessor epoch {} was never witnessed; previousEpochHead and prevSig are unchecked",
+                    "epoch {} has no chain-verified predecessor epoch {}; its link back to epoch 0 is unchecked",
                     parsed.epoch_number,
                     parsed.epoch_number - 1
                 ),
@@ -1349,6 +1365,59 @@ async fn evaluate_mailbox_keys_op<S: WitnessStore>(
             outcome,
         )
         .await?;
+    }
+    Ok(())
+}
+
+/// `true` when `next` (epoch N+1) links to `prev` (epoch N): its `previousEpochHead` is `prev`'s
+/// head and its `prevSig` verifies under `prev`'s signing key.
+fn mailbox_epoch_link_holds(prev: &MailboxEpochRecord, next: &MailboxEpochRecord) -> bool {
+    if prev.epoch_number.checked_add(1) != Some(next.epoch_number)
+        || next.previous_epoch_head.as_deref() != Some(prev.epoch_head.as_slice())
+    {
+        return false;
+    }
+    let msg = [
+        verify::LABYRINTH_PREV_SIG_PREFIX,
+        next.epoch_head.as_slice(),
+    ]
+    .concat();
+    verify::verify_labyrinth_xeddsa(
+        &prev.signing_pubkey,
+        &msg,
+        next.prev_sig.as_deref().unwrap_or_default(),
+        "prevSig",
+    )
+    .is_ok()
+}
+
+/// `verified` is chain-verified: upgrade each already-pinned later epoch whose link back to it
+/// holds, stopping at the first missing epoch or link that does not hold.
+async fn propagate_chain_verified<S: WitnessStore>(
+    store: &mut S,
+    actor_did: &str,
+    verified: &MailboxEpochRecord,
+) -> Result<()> {
+    let mut prev = verified.clone();
+    while let Some(next_num) = prev.epoch_number.checked_add(1) {
+        let Some(next) = store.get_mailbox_epoch(actor_did, next_num).await? else {
+            break;
+        };
+        if next.chain_verified || !mailbox_epoch_link_holds(&prev, &next) {
+            break;
+        }
+        store
+            .mark_mailbox_epoch_chain_verified(actor_did, next_num)
+            .await?;
+        metrics::WITNESS_RECORDS_INDEXED
+            .with_label_values(&[MAILBOX_KEYS_COLLECTION])
+            .inc();
+        info!(
+            actor_did,
+            epoch_number = next_num,
+            "Mailbox epoch is now chain-verified back to epoch 0"
+        );
+        prev = next;
     }
     Ok(())
 }
@@ -3189,19 +3258,21 @@ mod tests {
         );
     }
 
-    async fn apply_witness_migrations(pool: &sqlx::PgPool) {
-        for (name, sql) in [
-            (
-                "20261113000000_add_device_key_witness",
-                include_str!("../../../migrations/20261113000000_add_device_key_witness.up.sql"),
+    const WITNESS_MIGRATIONS: [(&str, &str); 2] = [
+        (
+            "20261113000000_add_device_key_witness",
+            include_str!("../../../migrations/20261113000000_add_device_key_witness.up.sql"),
+        ),
+        (
+            "20261116000000_add_witness_unverified_commits",
+            include_str!(
+                "../../../migrations/20261116000000_add_witness_unverified_commits.up.sql"
             ),
-            (
-                "20261116000000_add_witness_unverified_commits",
-                include_str!(
-                    "../../../migrations/20261116000000_add_witness_unverified_commits.up.sql"
-                ),
-            ),
-        ] {
+        ),
+    ];
+
+    async fn apply_migrations(pool: &sqlx::PgPool, migrations: &[(&str, &str)]) {
+        for (name, sql) in migrations {
             sqlx::raw_sql(sql)
                 .execute(pool)
                 .await
@@ -3209,8 +3280,19 @@ mod tests {
         }
     }
 
+    async fn apply_witness_migrations(pool: &sqlx::PgPool) {
+        apply_migrations(pool, &WITNESS_MIGRATIONS).await;
+    }
+
     /// Isolated schema on the test database named by `WITNESS_TEST_DATABASE_URL`.
     async fn isolated_witness_pool() -> (sqlx::PgPool, sqlx::PgPool, String) {
+        isolated_schema_pool(&WITNESS_MIGRATIONS).await
+    }
+
+    /// Isolated schema with only `migrations` applied.
+    async fn isolated_schema_pool(
+        migrations: &[(&str, &str)],
+    ) -> (sqlx::PgPool, sqlx::PgPool, String) {
         let user = std::env::var("USER").unwrap_or_else(|_| "postgres".to_string());
         let db_url = std::env::var("WITNESS_TEST_DATABASE_URL")
             .unwrap_or_else(|_| format!("postgres://{user}@127.0.0.1:5432/postgres"));
@@ -3239,7 +3321,7 @@ mod tests {
             .connect(&db_url)
             .await
             .expect("connect scoped witness pool");
-        apply_witness_migrations(&pool).await;
+        apply_migrations(&pool, migrations).await;
         (admin_pool, pool, schema)
     }
 
@@ -3368,6 +3450,247 @@ mod tests {
         assert!(out2.unverified.is_empty());
         assert_eq!(out2.indexed_mailbox_records, 1);
         assert_eq!(store.unverified.len(), 1);
+    }
+
+    /// One mailboxKeys op at `rkey` carrying `epoch`, with head byte `0x60 + epoch`.
+    fn mailbox_epoch_commit(did: &str, seq: i64, rkey: &str, epoch: i64) -> ObservedCommit {
+        let head = 0x60 + epoch as u8;
+        let prev = (epoch > 0).then(|| head - 1);
+        ObservedCommit {
+            actor_did: did.to_string(),
+            seq,
+            rev: format!("3l7hhhh{seq:06}"),
+            commit_cid: format!("bafyhenry{seq}"),
+            ops: vec![ObservedRepoOp {
+                action: if rkey == "self" { "update" } else { "create" }.to_string(),
+                path: format!("blue.catbird.labyrinth.mailboxKeys/{rkey}"),
+                cid: Some(format!("bafyhmk{epoch}")),
+                block: Some(encode_mailbox_cbor(did, epoch, head, prev)),
+            }],
+        }
+    }
+
+    /// Epoch 5 is missed, so 6 and 7 link only to unverified epochs. Neither may count as
+    /// witnessed until a chain back to epoch 0 exists, and then both are upgraded together.
+    async fn chain_verdict_carries_forward_through_unverified_epochs<S: WitnessStore>(
+        store: &mut S,
+        did: &str,
+    ) {
+        let out6 = evaluate_commit(store, &mailbox_epoch_commit(did, 100, "000000000006", 6))
+            .await
+            .unwrap();
+        assert!(out6.anomalies.is_empty(), "{:?}", out6.anomalies);
+        assert_eq!(out6.indexed_mailbox_records, 0);
+        assert_eq!(out6.unverified.len(), 1);
+        assert_eq!(
+            out6.unverified[0].reason,
+            UNVERIFIED_PRIOR_EPOCH_UNWITNESSED
+        );
+
+        let out7 = evaluate_commit(store, &mailbox_epoch_commit(did, 101, "self", 7))
+            .await
+            .unwrap();
+        assert!(out7.anomalies.is_empty(), "{:?}", out7.anomalies);
+        assert_eq!(
+            out7.indexed_mailbox_records, 0,
+            "an epoch linking to an unverified epoch must not count as witnessed"
+        );
+        assert_eq!(out7.unverified.len(), 1);
+        assert_eq!(
+            out7.unverified[0].reason,
+            UNVERIFIED_PRIOR_EPOCH_UNWITNESSED
+        );
+        assert!(
+            !store
+                .get_mailbox_epoch(did, 7)
+                .await
+                .unwrap()
+                .unwrap()
+                .chain_verified
+        );
+        let head = store.get_mailbox_head(did).await.unwrap().unwrap();
+        assert_eq!(head.current_epoch_number, 7);
+        assert!(
+            !head.current_epoch_chain_verified,
+            "the self head must not present an unverified epoch as witnessed"
+        );
+
+        for (i, epoch) in (0..=4).enumerate() {
+            let out = evaluate_commit(
+                store,
+                &mailbox_epoch_commit(did, 102 + i as i64, &format!("{epoch:012}"), epoch),
+            )
+            .await
+            .unwrap();
+            assert!(
+                out.anomalies.is_empty(),
+                "epoch {epoch}: {:?}",
+                out.anomalies
+            );
+            assert!(
+                out.unverified.is_empty(),
+                "epoch {epoch}: {:?}",
+                out.unverified
+            );
+            assert_eq!(out.indexed_mailbox_records, 1, "epoch {epoch}");
+        }
+        for epoch in [6, 7] {
+            assert!(
+                !store
+                    .get_mailbox_epoch(did, epoch)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .chain_verified,
+                "epoch {epoch} must stay unverified while epoch 5 is missing"
+            );
+        }
+
+        let out5 = evaluate_commit(store, &mailbox_epoch_commit(did, 107, "000000000005", 5))
+            .await
+            .unwrap();
+        assert!(out5.anomalies.is_empty(), "{:?}", out5.anomalies);
+        assert!(out5.unverified.is_empty(), "{:?}", out5.unverified);
+        assert_eq!(out5.indexed_mailbox_records, 1);
+        for epoch in [5, 6, 7] {
+            assert!(
+                store
+                    .get_mailbox_epoch(did, epoch)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .chain_verified,
+                "epoch {epoch} must be chain-verified once the chain reaches epoch 0"
+            );
+        }
+        let head = store.get_mailbox_head(did).await.unwrap().unwrap();
+        assert_eq!(head.current_epoch_number, 7);
+        assert!(head.current_epoch_chain_verified);
+    }
+
+    #[tokio::test]
+    async fn mailbox_chain_verdict_carries_forward_in_memory() {
+        let mut store = InMemoryWitnessStore::default();
+        chain_verdict_carries_forward_through_unverified_epochs(
+            &mut store,
+            "did:plc:henrygapchain0000000000008",
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn mailbox_chain_verdict_carries_forward_in_postgres() {
+        let (admin_pool, pool, schema) = isolated_witness_pool().await;
+        let mut tx = pool.begin().await.unwrap();
+        {
+            let mut store = PgWitnessStore::new(&mut tx);
+            chain_verdict_carries_forward_through_unverified_epochs(
+                &mut store,
+                "did:plc:henrygapchainpg00000000009",
+            )
+            .await;
+        }
+        tx.commit().await.unwrap();
+        let _ = sqlx::query(&format!("DROP SCHEMA IF EXISTS \"{schema}\" CASCADE"))
+            .execute(&admin_pool)
+            .await;
+    }
+
+    #[tokio::test]
+    async fn chain_verified_backfill_requires_an_unbroken_chain_from_epoch_zero() {
+        let (admin_pool, pool, schema) = isolated_schema_pool(&WITNESS_MIGRATIONS[..1]).await;
+
+        // ivy: 0 -> 1 -> 2 linked; mia: 0 -> 1, epoch 2 missing, 3 -> 4 linked to each other.
+        let rows: &[(&str, i64)] = &[
+            ("did:plc:ivybackfill", 0),
+            ("did:plc:ivybackfill", 1),
+            ("did:plc:ivybackfill", 2),
+            ("did:plc:miabackfill", 0),
+            ("did:plc:miabackfill", 1),
+            ("did:plc:miabackfill", 3),
+            ("did:plc:miabackfill", 4),
+        ];
+        for (did, epoch) in rows {
+            let head = vec![0x60 + *epoch as u8; 32];
+            let prev = (*epoch > 0).then(|| vec![0x5F + *epoch as u8; 32]);
+            sqlx::query(
+                r#"
+                INSERT INTO witness_mailbox_epochs (
+                    actor_did, epoch_number, rkey, record_cid, epoch_head, previous_epoch_head,
+                    signing_pubkey, auth_pubkey, encryption_pubkey, members_hash, self_sig,
+                    prev_sig, immutable_pinned, first_seen_seq, first_seen_rev
+                )
+                VALUES ($1, $2, $3, 'bafyx', $4, $5, '\x01', '\x02', '\x03', '\x04', '\x05',
+                        CASE WHEN $2 > 0 THEN '\x06'::bytea END, TRUE, $2, 'rev')
+                "#,
+            )
+            .bind(did)
+            .bind(epoch)
+            .bind(format!("{epoch:012}"))
+            .bind(head)
+            .bind(prev)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+        for (did, epoch) in [("did:plc:ivybackfill", 2i64), ("did:plc:miabackfill", 4)] {
+            sqlx::query(
+                r#"
+                INSERT INTO witness_mailbox_heads (
+                    actor_did, current_epoch_number, current_epoch_head, current_record_cid,
+                    last_seen_seq, last_seen_rev
+                )
+                VALUES ($1, $2, $3, 'bafyx', $2, 'rev')
+                "#,
+            )
+            .bind(did)
+            .bind(epoch)
+            .bind(vec![0x60 + epoch as u8; 32])
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+
+        apply_migrations(&pool, &WITNESS_MIGRATIONS[1..]).await;
+
+        let heads: Vec<(String, bool)> = sqlx::query_as(
+            "SELECT actor_did, current_epoch_chain_verified FROM witness_mailbox_heads \
+             ORDER BY actor_did",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            heads,
+            vec![
+                ("did:plc:ivybackfill".to_string(), true),
+                ("did:plc:miabackfill".to_string(), false),
+            ]
+        );
+
+        let verdicts: Vec<(String, i64, bool)> = sqlx::query_as(
+            "SELECT actor_did, epoch_number, chain_verified FROM witness_mailbox_epochs \
+             ORDER BY actor_did, epoch_number",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            verdicts,
+            vec![
+                ("did:plc:ivybackfill".to_string(), 0, true),
+                ("did:plc:ivybackfill".to_string(), 1, true),
+                ("did:plc:ivybackfill".to_string(), 2, true),
+                ("did:plc:miabackfill".to_string(), 0, true),
+                ("did:plc:miabackfill".to_string(), 1, true),
+                ("did:plc:miabackfill".to_string(), 3, false),
+                ("did:plc:miabackfill".to_string(), 4, false),
+            ]
+        );
+
+        let _ = sqlx::query(&format!("DROP SCHEMA IF EXISTS \"{schema}\" CASCADE"))
+            .execute(&admin_pool)
+            .await;
     }
 
     #[tokio::test]
