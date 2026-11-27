@@ -18,23 +18,11 @@ catbird-firehose-ingest = { path = "crates/ingest" }
 catbird-firehose-fanout = { path = "crates/fanout" }
 catbird-firehose-consumer-push = { path = "crates/consumer-push" }
 catbird-firehose-consumer-witness = { path = "crates/consumer-witness" }
-catbird-atproto = { path = "../catbird-atproto", features = ["namespace-bluecatbird"] }
-
-# AT Protocol (jacquard)
-jacquard = { version = "=0.12.1", default-features = false, features = ["api_full", "streaming", "dns", "cache"] }
-jacquard-common = { version = "=0.12.1", features = ["reqwest-client", "websocket"] }
-jacquard-api = { version = "=0.12.1", features = ["bluesky", "streaming"] }
-jacquard-identity = { version = "=0.12.1", features = ["dns", "cache"] }
 
 # AT Protocol (Petrel Rust). Sibling path checkouts: Petrel@cd6dda0d, PetrelCatbird@7658265c.
 petrel-core = { path = "../Petrel/rust/petrel-core" }
 petrel-firehose = { path = "../Petrel/rust/petrel-firehose" }
 petrel-catbird = { path = "../PetrelCatbird/rust/petrel-catbird" }
-
-# AT Protocol (atrium - kept for CAR parsing)
-atrium-repo = "0.1.5"
-ipld-core = { version = "0.4.2", default-features = false, features = ["std"] }
-serde_ipld_dagcbor = { version = "0.6.2", default-features = false, features = ["std"] }
 
 # Async runtime
 tokio = { version = "1.44", features = ["full"] }

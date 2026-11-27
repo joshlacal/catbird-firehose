@@ -14,6 +14,7 @@ Cargo workspace that connects to Bluesky's AT Protocol firehose, fans events out
 | **catbird-firehose-ingest** | `crates/ingest/` | Firehose WebSocket connection (`connection.rs`) and cursor persistence (`cursor.rs`) |
 | **catbird-firehose-fanout** | `crates/fanout/` | Broadcast dispatcher + `Consumer` trait for pluggable event consumers |
 | **catbird-firehose-consumer-push** | `crates/consumer-push/` | Push notification pipeline: event classification, APNS delivery, REST API, App Attest, relationship/moderation management |
+| **catbird-firehose-consumer-witness** | `crates/consumer-witness/` | Device and mailbox key transparency witness: verifies commit signatures and MST proofs for `blue.catbird.*` records |
 
 ## Build Commands
 
@@ -51,8 +52,10 @@ The binary (`src/main.rs`) also spawns:
 
 ## Key Dependencies
 
-- **jacquard** -- AT Protocol SDK (firehose subscription, API types, identity resolution)
-- **atrium-repo** + **serde_ipld_dagcbor** -- CAR block parsing and DAG-CBOR deserialization
+- **Petrel Rust** -- AT Protocol SDK, as sibling path checkouts `../Petrel` (pinned `cd6dda0d`) and `../PetrelCatbird` (pinned `7658265c`):
+  - `petrel-firehose` -- `subscribeRepos` subscription (reconnect, backoff, cursor acknowledgement), `RelayEvent` (the broadcast payload), CAR parsing
+  - `petrel-core` -- CIDs, the data-model `Value`, strict canonical DAG-CBOR
+  - `petrel-catbird` -- generated `blue.catbird.*` record types (witness: `chat.device`, `labyrinth.mailboxKeys`)
 - **a2** -- Apple Push Notification Service client
 - **sqlx** -- Async PostgreSQL with compile-time query checking
 - **axum** + **tower-http** -- HTTP API server
