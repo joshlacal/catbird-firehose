@@ -1,12 +1,13 @@
 //! DAG-CBOR record block → `serde_json::Value` for push classification.
 //!
 //! The JSON produced here is stored as `event_record` on push candidates, so its shape is
-//! part of the contract with the push sender. It mirrors what
-//! `serde_ipld_dagcbor::from_slice::<serde_json::Value>` produced before the Petrel
-//! migration: strings, integers, booleans, null, arrays and maps map directly, and a record
-//! that carries a CID link or a byte string anywhere is rejected (serde_json has no
-//! representation for either, so those records were never classified).
+//! part of the contract with the push sender. Strings, integers, booleans, null, arrays and
+//! maps map directly. A CID link becomes `{"$link": "<cid>"}` and a byte string becomes
+//! `{"$bytes": "<unpadded base64>"}`, the AT Protocol JSON forms, so a record that carries a
+//! blob (an image post, for example) is classified like any other.
 
+use base64::engine::general_purpose::STANDARD_NO_PAD;
+use base64::Engine;
 use petrel_core::dagcbor::{self, Limits};
 use petrel_core::Value;
 
@@ -35,8 +36,8 @@ fn value_to_json(value: Value) -> Result<serde_json::Value, RecordJsonError> {
         Value::Float(f) => serde_json::Number::from_f64(f.get())
             .map(serde_json::Value::Number)
             .ok_or(RecordJsonError::Unrepresentable("non-finite float"))?,
-        Value::Bytes(_) => return Err(RecordJsonError::Unrepresentable("byte string")),
-        Value::Link(_) => return Err(RecordJsonError::Unrepresentable("CID link")),
+        Value::Bytes(bytes) => serde_json::json!({ "$bytes": STANDARD_NO_PAD.encode(bytes) }),
+        Value::Link(cid) => serde_json::json!({ "$link": cid.to_string() }),
         Value::Array(items) => serde_json::Value::Array(
             items
                 .into_iter()
@@ -96,17 +97,57 @@ mod tests {
     }
 
     #[test]
-    fn links_and_bytes_stay_unclassifiable() {
+    fn image_post_keeps_its_blob_link_as_atproto_json() {
         let cid = Cid::for_dag_cbor(b"blob");
-        let with_link = object(vec![("embed", object(vec![("ref", Value::Link(cid))]))]);
+        let blob = object(vec![
+            ("$type", Value::String("blob".into())),
+            ("ref", Value::Link(cid.clone())),
+            ("mimeType", Value::String("image/jpeg".into())),
+            ("size", Value::Integer(1234)),
+        ]);
+        let image = object(vec![
+            ("alt", Value::String("a cat".into())),
+            ("image", blob),
+        ]);
+        let record = object(vec![
+            ("$type", Value::String("app.bsky.feed.post".into())),
+            ("text", Value::String("look @alice".into())),
+            (
+                "embed",
+                object(vec![
+                    ("$type", Value::String("app.bsky.embed.images".into())),
+                    ("images", Value::Array(vec![image])),
+                ]),
+            ),
+        ]);
+        let json = dag_cbor_record_to_json(&petrel_core::dagcbor::encode(&record)).unwrap();
         assert_eq!(
-            dag_cbor_record_to_json(&petrel_core::dagcbor::encode(&with_link)),
-            Err(RecordJsonError::Unrepresentable("CID link"))
+            json,
+            json!({
+                "$type": "app.bsky.feed.post",
+                "text": "look @alice",
+                "embed": {
+                    "$type": "app.bsky.embed.images",
+                    "images": [{
+                        "alt": "a cat",
+                        "image": {
+                            "$type": "blob",
+                            "ref": { "$link": cid.to_string() },
+                            "mimeType": "image/jpeg",
+                            "size": 1234,
+                        },
+                    }],
+                },
+            })
         );
-        let with_bytes = object(vec![("b", Value::Bytes(vec![1, 2]))]);
+    }
+
+    #[test]
+    fn byte_strings_become_unpadded_base64() {
+        let record = object(vec![("b", Value::Bytes(vec![1, 2]))]);
         assert_eq!(
-            dag_cbor_record_to_json(&petrel_core::dagcbor::encode(&with_bytes)),
-            Err(RecordJsonError::Unrepresentable("byte string"))
+            dag_cbor_record_to_json(&petrel_core::dagcbor::encode(&record)).unwrap(),
+            json!({ "b": { "$bytes": "AQI" } })
         );
     }
 
