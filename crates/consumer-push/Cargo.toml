@@ -8,11 +8,9 @@ publish.workspace = true
 [dependencies]
 catbird-firehose-fanout = { workspace = true }
 
-jacquard-api = { workspace = true }
-
-# CAR parsing
-atrium-repo = { workspace = true }
-serde_ipld_dagcbor = { workspace = true }
+# CAR / DAG-CBOR parsing
+petrel-core = { workspace = true }
+petrel-firehose = { workspace = true }
 
 # Async
 tokio = { workspace = true }

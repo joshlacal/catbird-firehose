@@ -1,13 +1,13 @@
 use std::sync::Arc;
 
 use anyhow::Result;
-use jacquard_api::com_atproto::sync::subscribe_repos::SubscribeReposMessage;
+use petrel_firehose::RelayEvent;
 use tokio::sync::broadcast;
 use tracing::{error, warn};
 
 /// Trait for firehose event consumers.
 ///
-/// Each consumer receives all `SubscribeReposMessage` events and filters
+/// Each consumer receives all `RelayEvent` events and filters
 /// internally based on the collections / event types it cares about.
 pub trait Consumer: Send + Sync + 'static {
     /// Human-readable name for logging.
@@ -22,7 +22,7 @@ pub trait Consumer: Send + Sync + 'static {
     /// Process a single firehose event.
     fn handle_event(
         &self,
-        event: Arc<SubscribeReposMessage>,
+        event: Arc<RelayEvent>,
     ) -> impl std::future::Future<Output = Result<()>> + Send;
 }
 
@@ -32,7 +32,7 @@ pub trait Consumer: Send + Sync + 'static {
 /// Returns a `JoinHandle` for the consumer task.
 pub fn spawn_consumer<C: Consumer>(
     consumer: Arc<C>,
-    mut rx: broadcast::Receiver<Arc<SubscribeReposMessage>>,
+    mut rx: broadcast::Receiver<Arc<RelayEvent>>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         loop {
@@ -66,7 +66,7 @@ pub fn spawn_consumer<C: Consumer>(
 mod tests {
     use super::{spawn_consumer, Consumer};
     use anyhow::Result;
-    use jacquard_api::com_atproto::sync::subscribe_repos::{Info, SubscribeReposMessage};
+    use petrel_firehose::{RelayEvent, RelayInfoEvent};
     use std::sync::{
         atomic::{AtomicU64, Ordering},
         Arc,
@@ -88,7 +88,7 @@ mod tests {
             self.dropped.fetch_add(dropped_events, Ordering::SeqCst);
         }
 
-        async fn handle_event(&self, _event: Arc<SubscribeReposMessage>) -> Result<()> {
+        async fn handle_event(&self, _event: Arc<RelayEvent>) -> Result<()> {
             self.handled.fetch_add(1, Ordering::SeqCst);
             Ok(())
         }
@@ -97,7 +97,10 @@ mod tests {
     #[tokio::test]
     async fn reports_exact_lagged_event_count_and_continues() {
         let (sender, receiver) = broadcast::channel(1);
-        let event = Arc::new(SubscribeReposMessage::Info(Box::<Info>::default()));
+        let event = Arc::new(RelayEvent::Info(RelayInfoEvent {
+            name: "OutdatedCursor".to_string(),
+            message: None,
+        }));
         sender.send(event.clone()).expect("receiver is active");
         sender.send(event.clone()).expect("receiver is active");
         sender.send(event).expect("receiver is active");

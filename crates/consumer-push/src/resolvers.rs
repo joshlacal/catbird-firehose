@@ -44,7 +44,7 @@ struct CachedDidInfo {
     expires_at: Instant,
 }
 
-// TODO: Migrate to jacquard-identity PublicResolver once the dependency is integrated.
+// TODO: Migrate to Petrel identity resolution (`petrel::identity`) once nest owns resolution.
 // The current implementation uses direct HTTP calls to plc.directory and did:web endpoints.
 #[derive(Clone)]
 pub struct DidResolver {

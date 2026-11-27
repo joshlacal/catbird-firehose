@@ -5,14 +5,14 @@
 // Tungstenite requires its unboxed HTTP error response in handshake callbacks.
 #![allow(clippy::result_large_err)]
 
-use std::{sync::Arc, time::Duration};
+use std::{collections::BTreeMap, sync::Arc, time::Duration};
 
 use catbird_firehose_ingest::{
     connection::run_firehose_ingest_with_store, cursor::MemoryCursorStore,
 };
-use ciborium::Value;
 use futures::SinkExt;
-use jacquard_api::com_atproto::sync::subscribe_repos::SubscribeReposMessage;
+use petrel_core::{dagcbor, Cid, Value};
+use petrel_firehose::RelayEvent;
 use tokio::{
     net::TcpListener,
     sync::{broadcast, mpsc, watch},
@@ -23,36 +23,38 @@ use tokio_tungstenite::{
     tungstenite::{handshake::server::Request, Message},
 };
 
-fn field(name: &str, value: Value) -> (Value, Value) {
-    (Value::Text(name.into()), value)
+fn object(entries: Vec<(&str, Value)>) -> Value {
+    Value::Object(
+        entries
+            .into_iter()
+            .map(|(name, value)| (name.to_string(), value))
+            .collect::<BTreeMap<_, _>>(),
+    )
 }
 
+/// One canonical DAG-CBOR `#commit` frame (header then body).
 fn commit_frame(seq: i64, rev: &str) -> Vec<u8> {
-    // CIDv1, dag-cbor, sha2-256, 32-byte digest. Tag 42 has a leading zero.
-    let mut cid = vec![0, 1, 0x71, 0x12, 0x20];
-    cid.extend([0; 32]);
-    let header = Value::Map(vec![
-        field("op", Value::Integer(1.into())),
-        field("t", Value::Text("#commit".into())),
+    let header = object(vec![
+        ("op", Value::Integer(1)),
+        ("t", Value::String("#commit".into())),
     ]);
-    let body = Value::Map(vec![
-        field("blobs", Value::Array(vec![])),
-        field("blocks", Value::Bytes(vec![])),
-        field("commit", Value::Tag(42, Box::new(Value::Bytes(cid)))),
-        field("ops", Value::Array(vec![])),
-        field("rebase", Value::Bool(false)),
-        field(
+    let body = object(vec![
+        ("blobs", Value::Array(vec![])),
+        ("blocks", Value::Bytes(vec![])),
+        ("commit", Value::Link(Cid::for_dag_cbor(b"commit"))),
+        ("ops", Value::Array(vec![])),
+        ("rebase", Value::Bool(false)),
+        (
             "repo",
-            Value::Text("did:plc:abcdefghijklmnopqrstuvwx".into()),
+            Value::String("did:plc:abcdefghijklmnopqrstuvwx".into()),
         ),
-        field("rev", Value::Text(rev.into())),
-        field("seq", Value::Integer(seq.into())),
-        field("time", Value::Text("2026-09-11T12:00:00Z".into())),
-        field("tooBig", Value::Bool(false)),
+        ("rev", Value::String(rev.into())),
+        ("seq", Value::Integer(seq)),
+        ("time", Value::String("2026-09-11T12:00:00Z".into())),
+        ("tooBig", Value::Bool(false)),
     ]);
-    let mut bytes = vec![];
-    ciborium::into_writer(&header, &mut bytes).unwrap();
-    ciborium::into_writer(&body, &mut bytes).unwrap();
+    let mut bytes = dagcbor::encode(&header);
+    bytes.extend(dagcbor::encode(&body));
     bytes
 }
 
@@ -60,13 +62,13 @@ fn seeded_cursor() -> Arc<MemoryCursorStore> {
     Arc::new(MemoryCursorStore::with_cursor(100))
 }
 
-async fn next_seq(receiver: &mut broadcast::Receiver<Arc<SubscribeReposMessage>>) -> i64 {
+async fn next_seq(receiver: &mut broadcast::Receiver<Arc<RelayEvent>>) -> i64 {
     let event = timeout(Duration::from_secs(5), receiver.recv())
         .await
         .expect("ingest must dispatch the next valid commit")
         .unwrap();
     match &*event {
-        SubscribeReposMessage::Commit(commit) => commit.seq,
+        RelayEvent::Commit(commit) => commit.seq,
         other => panic!("unexpected event: {other:?}"),
     }
 }
@@ -239,4 +241,144 @@ async fn immediately_closed_streams_back_off_before_reconnecting() {
         "closed streams must wait before reconnecting; actual delay {:?}",
         second.duration_since(first)
     );
+}
+
+/// A frame that fails canonical DAG-CBOR parsing (`MalformedFrame`) is skipped on the open
+/// connection: no reconnect, and the following commit is still delivered.
+#[tokio::test]
+async fn non_canonical_frame_is_skipped_without_reconnecting() {
+    let cursor = seeded_cursor();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = format!("ws://{}", listener.local_addr().unwrap());
+    let (connections, mut observed_connections) = mpsc::unbounded_channel();
+    let relay = tokio::spawn(async move {
+        let mut sockets = vec![];
+        loop {
+            let (tcp, _) = listener.accept().await.unwrap();
+            let mut ws = accept_hdr_async(tcp, |request: &Request, response| {
+                connections.send(request.uri().to_string()).unwrap();
+                Ok(response)
+            })
+            .await
+            .unwrap();
+            ws.send(Message::Binary(commit_frame(101, "3jzfcijpj2z2a")))
+                .await
+                .unwrap();
+            // Header map {"op": 1, "t": "#commit"} with the longer key first: DAG-CBOR
+            // orders keys by length, so this frame is not canonical.
+            let mut garbage = vec![0xa2, 0x62, b'o', b'p', 0x01, 0x61, b't'];
+            garbage.extend([0x67, b'#', b'c', b'o', b'm', b'm', b'i', b't']);
+            ws.send(Message::Binary(garbage)).await.unwrap();
+            ws.send(Message::Binary(commit_frame(102, "3jzfcijpj2z2b")))
+                .await
+                .unwrap();
+            sockets.push(ws);
+        }
+    });
+    let (dispatcher, mut receiver) = broadcast::channel(16);
+    let (stop, shutdown) = watch::channel(false);
+    let ingest = tokio::spawn(run_firehose_ingest_with_store(
+        endpoint,
+        dispatcher,
+        cursor.clone(),
+        shutdown,
+    ));
+
+    let received = [next_seq(&mut receiver).await, next_seq(&mut receiver).await];
+    stop.send(true).unwrap();
+    timeout(Duration::from_secs(2), ingest)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    relay.abort();
+
+    assert_eq!(received, [101, 102]);
+    assert!(observed_connections
+        .recv()
+        .await
+        .unwrap()
+        .ends_with("?cursor=100"));
+    assert!(
+        observed_connections.try_recv().is_err(),
+        "malformed frame must not reconnect"
+    );
+}
+
+/// A frame the transport refuses as too large on every attempt (`FrameTooLargeAtCursor`)
+/// moves the cursor one past the last decoded seq instead of failing forever.
+#[tokio::test]
+async fn persistent_oversize_frame_skips_one_sequence() {
+    let cursor = seeded_cursor();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = format!("ws://{}", listener.local_addr().unwrap());
+    let (connections, mut observed_connections) = mpsc::unbounded_channel();
+    let relay = tokio::spawn(async move {
+        let mut sockets = vec![];
+        loop {
+            let (tcp, _) = listener.accept().await.unwrap();
+            let (uri_tx, uri_rx) = std::sync::mpsc::channel();
+            let mut ws = accept_hdr_async(tcp, |request: &Request, response| {
+                let uri = request.uri().to_string();
+                connections.send(uri.clone()).unwrap();
+                uri_tx.send(uri).unwrap();
+                Ok(response)
+            })
+            .await
+            .unwrap();
+            let uri = uri_rx.recv().unwrap();
+            if uri.ends_with("?cursor=100") {
+                ws.send(Message::Binary(commit_frame(101, "3jzfcijpj2z2a")))
+                    .await
+                    .unwrap();
+            }
+            if uri.ends_with("?cursor=102") {
+                ws.send(Message::Binary(commit_frame(103, "3jzfcijpj2z2c")))
+                    .await
+                    .unwrap();
+            } else {
+                // Larger than the 5 MB transport limit.
+                let _ = ws.send(Message::Binary(vec![0; 5_000_100])).await;
+            }
+            sockets.push(ws);
+        }
+    });
+    let (dispatcher, mut receiver) = broadcast::channel(16);
+    let (stop, shutdown) = watch::channel(false);
+    let ingest = tokio::spawn(run_firehose_ingest_with_store(
+        endpoint,
+        dispatcher,
+        cursor.clone(),
+        shutdown,
+    ));
+
+    assert_eq!(next_seq(&mut receiver).await, 101);
+    let after_skip = timeout(Duration::from_secs(15), receiver.recv())
+        .await
+        .expect("ingest must resume past the oversize frame")
+        .unwrap();
+    stop.send(true).unwrap();
+    timeout(Duration::from_secs(2), ingest)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    relay.abort();
+
+    match &*after_skip {
+        RelayEvent::Commit(commit) => assert_eq!(commit.seq, 103),
+        other => panic!("unexpected event: {other:?}"),
+    }
+    let mut uris = vec![];
+    while let Ok(uri) = observed_connections.try_recv() {
+        uris.push(uri);
+    }
+    assert!(uris[0].ends_with("?cursor=100"), "{uris:?}");
+    assert!(
+        uris[1..uris.len() - 1]
+            .iter()
+            .all(|uri| uri.ends_with("?cursor=101")),
+        "{uris:?}"
+    );
+    assert!(uris.last().unwrap().ends_with("?cursor=102"), "{uris:?}");
 }

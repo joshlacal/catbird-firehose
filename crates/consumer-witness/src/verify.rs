@@ -2,9 +2,7 @@
 //! `#atproto` DID keys, compact 64-byte low-S ECDSA, canonical DAG-CBOR, MST inclusion/exclusion)
 //! and Labyrinth transparency record signatures (`MailboxKeys` XEdDSA + Ed25519 attestation).
 
-#[cfg(test)]
-use std::collections::BTreeMap;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::net::IpAddr;
 use std::sync::{
     atomic::{AtomicU64, Ordering},
@@ -18,11 +16,8 @@ use constant_time_eq::constant_time_eq;
 #[cfg(test)]
 use curve25519_dalek::scalar::clamp_integer;
 use curve25519_dalek::{edwards::EdwardsPoint, montgomery::MontgomeryPoint, scalar::Scalar};
-use ipld_core::{
-    cid::{Cid, Version},
-    ipld::Ipld,
-};
 use multibase::Base;
+use petrel_core::{Cid, Value};
 use reqwest::Client as HttpClient;
 use serde::Deserialize;
 use sha2::{Digest, Sha512};
@@ -584,10 +579,9 @@ fn build_safe_did_web_url(did: &str) -> Result<Url, String> {
 }
 
 pub(crate) fn is_valid_dag_cbor_sha256_cid_v1(cid: &Cid) -> bool {
-    cid.version() == Version::V1
-        && cid.codec() == DAG_CBOR_CODEC
-        && cid.hash().code() == SHA2_256_CODE
-        && cid.hash().digest().len() == SHA2_256_DIGEST_LEN
+    cid.codec() == DAG_CBOR_CODEC
+        && cid.hash_code() == SHA2_256_CODE
+        && cid.digest().len() == SHA2_256_DIGEST_LEN
 }
 
 fn read_cbor_uint(bytes: &[u8], pos: &mut usize, info: u8) -> Result<u64, String> {
@@ -760,9 +754,9 @@ fn verify_canonical_dagcbor_item(
             if cid_bytes.first() != Some(&0x00) {
                 return Err("DAG-CBOR tag 42 CID missing identity multibase prefix".to_string());
             }
-            let parsed = Cid::try_from(&cid_bytes[1..])
+            let parsed = Cid::from_bytes(&cid_bytes[1..])
                 .map_err(|_| "invalid CID inside tag 42".to_string())?;
-            if parsed.to_bytes().as_slice() != &cid_bytes[1..] {
+            if parsed.as_bytes() != &cid_bytes[1..] {
                 return Err("non-canonical CID bytes inside tag 42".to_string());
             }
             *pos = end;
@@ -804,9 +798,9 @@ pub fn verify_atproto_v3_commit_signature(
     }
     verify_canonical_dagcbor(commit_block).map_err(CommitVerifyError::MalformedCommitCbor)?;
 
-    let decoded: Ipld = serde_ipld_dagcbor::from_slice(commit_block)
+    let decoded: Value = petrel_core::from_dag_cbor(commit_block)
         .map_err(|e| CommitVerifyError::MalformedCommitCbor(e.to_string()))?;
-    let Ipld::Map(mut map) = decoded else {
+    let Value::Object(mut map) = decoded else {
         return Err(CommitVerifyError::MalformedCommitCbor(
             "commit root must be a DAG-CBOR map".to_string(),
         ));
@@ -820,7 +814,7 @@ pub fn verify_atproto_v3_commit_signature(
     }
 
     match map.get("version") {
-        Some(Ipld::Integer(3)) => {}
+        Some(Value::Integer(3)) => {}
         Some(other) => {
             return Err(CommitVerifyError::CommitMetadataMismatch(format!(
                 "expected ATProto commit version 3, got {other:?}"
@@ -834,8 +828,8 @@ pub fn verify_atproto_v3_commit_signature(
     }
 
     match map.get("did") {
-        Some(Ipld::String(did)) if did == expected_did => {}
-        Some(Ipld::String(did)) => {
+        Some(Value::String(did)) if did == expected_did => {}
+        Some(Value::String(did)) => {
             return Err(CommitVerifyError::CommitMetadataMismatch(format!(
                 "commit DID '{did}' does not match firehose repo '{expected_did}'"
             )));
@@ -848,8 +842,8 @@ pub fn verify_atproto_v3_commit_signature(
     }
 
     match map.get("rev") {
-        Some(Ipld::String(rev)) if !rev.is_empty() && rev.len() <= 64 && rev == expected_rev => {}
-        Some(Ipld::String(rev)) => {
+        Some(Value::String(rev)) if !rev.is_empty() && rev.len() <= 64 && rev == expected_rev => {}
+        Some(Value::String(rev)) => {
             return Err(CommitVerifyError::CommitMetadataMismatch(format!(
                 "commit rev '{rev}' does not match firehose rev '{expected_rev}'"
             )));
@@ -862,7 +856,7 @@ pub fn verify_atproto_v3_commit_signature(
     }
 
     let data_cid = match map.get("data") {
-        Some(Ipld::Link(cid)) if is_valid_dag_cbor_sha256_cid_v1(cid) => *cid,
+        Some(Value::Link(cid)) if is_valid_dag_cbor_sha256_cid_v1(cid) => cid.clone(),
         _ => {
             return Err(CommitVerifyError::MalformedCommitCbor(
                 "missing or non-CIDv1(dag-cbor, sha2-256) 'data' link in commit".to_string(),
@@ -871,8 +865,8 @@ pub fn verify_atproto_v3_commit_signature(
     };
 
     match map.get("prev") {
-        Some(Ipld::Null) => {}
-        Some(Ipld::Link(prev_cid)) if is_valid_dag_cbor_sha256_cid_v1(prev_cid) => {}
+        Some(Value::Null) => {}
+        Some(Value::Link(prev_cid)) if is_valid_dag_cbor_sha256_cid_v1(prev_cid) => {}
         _ => {
             return Err(CommitVerifyError::MalformedCommitCbor(
                 "ATProto v3 commit requires 'prev' as null or valid CIDv1 link".to_string(),
@@ -881,7 +875,7 @@ pub fn verify_atproto_v3_commit_signature(
     }
 
     let sig_bytes = match map.remove("sig") {
-        Some(Ipld::Bytes(bytes)) => bytes,
+        Some(Value::Bytes(bytes)) => bytes,
         _ => {
             return Err(CommitVerifyError::MalformedCommitCbor(
                 "missing or non-bytes 'sig' field in commit".to_string(),
@@ -889,7 +883,7 @@ pub fn verify_atproto_v3_commit_signature(
         }
     };
 
-    let unsigned_cbor = serde_ipld_dagcbor::to_vec(&Ipld::Map(map)).map_err(|e| {
+    let unsigned_cbor = petrel_core::to_dag_cbor(&Value::Object(map)).map_err(|e| {
         CommitVerifyError::MalformedCommitCbor(format!("encode unsigned commit: {e}"))
     })?;
     debug_assert!(verify_canonical_dagcbor(&unsigned_cbor).is_ok());
@@ -898,40 +892,73 @@ pub fn verify_atproto_v3_commit_signature(
     Ok(data_cid)
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug)]
 struct MstEntry {
     p: usize,
-    #[serde(with = "cbor_byte_vec")]
     k: Vec<u8>,
     v: Cid,
     t: Option<Cid>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug)]
 struct MstNodeData {
     l: Option<Cid>,
     e: Vec<MstEntry>,
 }
 
-mod cbor_byte_vec {
-    use serde::Deserializer;
+fn mst_field<'a>(map: &'a BTreeMap<String, Value>, name: &str) -> Result<&'a Value, String> {
+    map.get(name)
+        .ok_or_else(|| format!("missing field `{name}`"))
+}
 
-    pub fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Vec<u8>, D::Error> {
-        struct BytesVisitor;
-        impl serde::de::Visitor<'_> for BytesVisitor {
-            type Value = Vec<u8>;
-            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-                f.write_str("a CBOR byte string")
-            }
-            fn visit_bytes<E: serde::de::Error>(self, v: &[u8]) -> Result<Vec<u8>, E> {
-                Ok(v.to_vec())
-            }
-            fn visit_byte_buf<E: serde::de::Error>(self, v: Vec<u8>) -> Result<Vec<u8>, E> {
-                Ok(v)
-            }
-        }
-        deserializer.deserialize_byte_buf(BytesVisitor)
+fn mst_optional_link(value: Option<&Value>, name: &str) -> Result<Option<Cid>, String> {
+    match value {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::Link(cid)) => Ok(Some(cid.clone())),
+        Some(other) => Err(format!(
+            "`{name}` must be a CID link or null, got {}",
+            other.kind()
+        )),
     }
+}
+
+/// Reads an MST node the way the previous serde decoding did: `l`/`e` and `p`/`k`/`v`/`t`
+/// are required (`l` and `t` may be null or absent) and other keys are ignored.
+fn parse_mst_node(bytes: &[u8]) -> Result<MstNodeData, String> {
+    let value: Value = petrel_core::from_dag_cbor(bytes).map_err(|e| e.to_string())?;
+    let Value::Object(node) = value else {
+        return Err("MST node must be a map".to_string());
+    };
+    let l = mst_optional_link(node.get("l"), "l")?;
+    let Value::Array(raw_entries) = mst_field(&node, "e")? else {
+        return Err("`e` must be an array".to_string());
+    };
+    let mut e = Vec::with_capacity(raw_entries.len());
+    for raw in raw_entries {
+        let Value::Object(entry) = raw else {
+            return Err("MST entry must be a map".to_string());
+        };
+        let p = match mst_field(entry, "p")? {
+            Value::Integer(p) => {
+                usize::try_from(*p).map_err(|_| "`p` must be a non-negative integer".to_string())?
+            }
+            _ => return Err("`p` must be an integer".to_string()),
+        };
+        let Value::Bytes(k) = mst_field(entry, "k")? else {
+            return Err("`k` must be a byte string".to_string());
+        };
+        let Value::Link(v) = mst_field(entry, "v")? else {
+            return Err("`v` must be a CID link".to_string());
+        };
+        let t = mst_optional_link(entry.get("t"), "t")?;
+        e.push(MstEntry {
+            p,
+            k: k.clone(),
+            v: v.clone(),
+            t,
+        });
+    }
+    Ok(MstNodeData { l, e })
 }
 
 /// ATProto MST layer of `key`: the number of leading zero 2-bit chunks of `SHA-256(key)`
@@ -1002,7 +1029,7 @@ fn walk_mst_node(
     if depth > MST_MAX_DEPTH {
         return Err("MST proof exceeded maximum depth".to_string());
     }
-    if !visited.insert(node_cid) {
+    if !visited.insert(node_cid.clone()) {
         return Err("cycle detected in MST proof".to_string());
     }
     let node_bytes = blocks
@@ -1010,8 +1037,7 @@ fn walk_mst_node(
         .copied()
         .ok_or_else(|| format!("missing MST node block {node_cid} in CAR archive"))?;
     verify_canonical_dagcbor(node_bytes)?;
-    let node: MstNodeData = serde_ipld_dagcbor::from_slice(node_bytes)
-        .map_err(|e| format!("malformed MST node block: {e}"))?;
+    let node = parse_mst_node(node_bytes).map_err(|e| format!("malformed MST node block: {e}"))?;
 
     let mut keys: Vec<Vec<u8>> = Vec::with_capacity(node.e.len());
     for (idx, entry) in node.e.iter().enumerate() {
@@ -1089,7 +1115,7 @@ fn walk_mst_node(
             }
             layer
         }
-        None => match (expected_layer, node.l) {
+        None => match (expected_layer, &node.l) {
             // Empty repository.
             (None, None) => return Ok(None),
             (None, Some(_)) => {
@@ -1125,7 +1151,7 @@ fn walk_mst_node(
     }
 
     match keys.binary_search_by(|candidate| candidate.as_slice().cmp(target_key)) {
-        Ok(idx) => Ok(Some(node.e[idx].v)),
+        Ok(idx) => Ok(Some(node.e[idx].v.clone())),
         Err(0) => match node.l {
             Some(left_cid) => walk_mst_node(
                 blocks,
@@ -1144,7 +1170,7 @@ fn walk_mst_node(
         Err(insert_pos) => {
             let idx = insert_pos - 1;
             let next_upper = keys.get(insert_pos).map(Vec::as_slice).or(upper_bound);
-            match node.e[idx].t {
+            match node.e[idx].t.clone() {
                 Some(sub_cid) => walk_mst_node(
                     blocks,
                     sub_cid,
@@ -1344,12 +1370,15 @@ pub(crate) fn encode_unsigned_v3_commit_cbor(
     prev_cid: Option<Cid>,
 ) -> Vec<u8> {
     let mut map = BTreeMap::new();
-    map.insert("did".to_string(), Ipld::String(did.to_string()));
-    map.insert("version".to_string(), Ipld::Integer(3));
-    map.insert("data".to_string(), Ipld::Link(data_cid));
-    map.insert("rev".to_string(), Ipld::String(rev.to_string()));
-    map.insert("prev".to_string(), prev_cid.map_or(Ipld::Null, Ipld::Link));
-    serde_ipld_dagcbor::to_vec(&Ipld::Map(map)).expect("encode unsigned v3 commit")
+    map.insert("did".to_string(), Value::String(did.to_string()));
+    map.insert("version".to_string(), Value::Integer(3));
+    map.insert("data".to_string(), Value::Link(data_cid));
+    map.insert("rev".to_string(), Value::String(rev.to_string()));
+    map.insert(
+        "prev".to_string(),
+        prev_cid.map_or(Value::Null, Value::Link),
+    );
+    petrel_core::to_dag_cbor(&Value::Object(map)).expect("encode unsigned v3 commit")
 }
 
 #[cfg(test)]
@@ -1361,22 +1390,21 @@ pub(crate) fn encode_signed_v3_commit_cbor(
     sig_bytes: Vec<u8>,
 ) -> Vec<u8> {
     let mut map = BTreeMap::new();
-    map.insert("did".to_string(), Ipld::String(did.to_string()));
-    map.insert("version".to_string(), Ipld::Integer(3));
-    map.insert("data".to_string(), Ipld::Link(data_cid));
-    map.insert("rev".to_string(), Ipld::String(rev.to_string()));
-    map.insert("prev".to_string(), prev_cid.map_or(Ipld::Null, Ipld::Link));
-    map.insert("sig".to_string(), Ipld::Bytes(sig_bytes));
-    serde_ipld_dagcbor::to_vec(&Ipld::Map(map)).expect("encode signed v3 commit")
+    map.insert("did".to_string(), Value::String(did.to_string()));
+    map.insert("version".to_string(), Value::Integer(3));
+    map.insert("data".to_string(), Value::Link(data_cid));
+    map.insert("rev".to_string(), Value::String(rev.to_string()));
+    map.insert(
+        "prev".to_string(),
+        prev_cid.map_or(Value::Null, Value::Link),
+    );
+    map.insert("sig".to_string(), Value::Bytes(sig_bytes));
+    petrel_core::to_dag_cbor(&Value::Object(map)).expect("encode signed v3 commit")
 }
 
 #[cfg(test)]
 pub(crate) fn compute_dagcbor_cid(block: &[u8]) -> Cid {
-    use sha2::Sha256;
-    let digest = Sha256::digest(block);
-    let mh = ipld_core::cid::multihash::Multihash::wrap(SHA2_256_CODE, &digest)
-        .expect("wrap sha2-256 multihash");
-    Cid::new_v1(DAG_CBOR_CODEC, mh)
+    Cid::for_dag_cbor(block)
 }
 
 #[cfg(test)]
@@ -1399,7 +1427,7 @@ pub(crate) fn sign_k256_low_s(sk: &k256::ecdsa::SigningKey, msg: &[u8]) -> Vec<u
 pub(crate) fn encode_mst_leaf_cbor(sorted_records: &BTreeMap<String, Cid>) -> Vec<u8> {
     let entries: Vec<(&[u8], Cid, Option<Cid>)> = sorted_records
         .iter()
-        .map(|(path, cid)| (path.as_bytes(), *cid, None))
+        .map(|(path, cid)| (path.as_bytes(), cid.clone(), None))
         .collect();
     encode_mst_node_cbor(None, &entries)
 }
@@ -1411,7 +1439,7 @@ pub(crate) fn encode_mst_leaf_cbor(sorted_records: &BTreeMap<String, Cid>) -> Ve
 pub(crate) fn encode_canonical_mst(records: &BTreeMap<String, Cid>) -> (Cid, Vec<(Cid, Vec<u8>)>) {
     let items: Vec<(&[u8], Cid)> = records
         .iter()
-        .map(|(path, cid)| (path.as_bytes(), *cid))
+        .map(|(path, cid)| (path.as_bytes(), cid.clone()))
         .collect();
     let root_layer = items
         .iter()
@@ -1432,7 +1460,7 @@ fn build_canonical_mst_node(
     let mut left = None;
     let mut entries: Vec<(&[u8], Cid, Option<Cid>)> = Vec::new();
     let mut group: Vec<(&[u8], Cid)> = Vec::new();
-    for &(key, cid) in items {
+    for (key, cid) in items.iter().cloned() {
         if mst_key_layer(key) == layer {
             attach_canonical_subtree(&mut group, layer, &mut left, &mut entries, blocks);
             entries.push((key, cid, None));
@@ -1443,7 +1471,7 @@ fn build_canonical_mst_node(
     attach_canonical_subtree(&mut group, layer, &mut left, &mut entries, blocks);
     let bytes = encode_mst_node_cbor(left, &entries);
     let cid = compute_dagcbor_cid(&bytes);
-    blocks.push((cid, bytes));
+    blocks.push((cid.clone(), bytes));
     cid
 }
 
@@ -1477,7 +1505,7 @@ pub(crate) fn encode_mst_node_cbor(
 ) -> Vec<u8> {
     let mut entries = Vec::with_capacity(sorted.len());
     let mut prev_key: Option<&[u8]> = None;
-    for &(key_bytes, cid, subtree) in sorted {
+    for (key_bytes, cid, subtree) in sorted.iter().cloned() {
         let prefix_len = match prev_key {
             None => 0usize,
             Some(prev) => prev
@@ -1488,17 +1516,17 @@ pub(crate) fn encode_mst_node_cbor(
         };
         let suffix = key_bytes[prefix_len..].to_vec();
         let mut entry_map = BTreeMap::new();
-        entry_map.insert("p".to_string(), Ipld::Integer(prefix_len as i128));
-        entry_map.insert("k".to_string(), Ipld::Bytes(suffix));
-        entry_map.insert("v".to_string(), Ipld::Link(cid));
-        entry_map.insert("t".to_string(), subtree.map_or(Ipld::Null, Ipld::Link));
-        entries.push(Ipld::Map(entry_map));
+        entry_map.insert("p".to_string(), Value::Integer(prefix_len as i64));
+        entry_map.insert("k".to_string(), Value::Bytes(suffix));
+        entry_map.insert("v".to_string(), Value::Link(cid));
+        entry_map.insert("t".to_string(), subtree.map_or(Value::Null, Value::Link));
+        entries.push(Value::Object(entry_map));
         prev_key = Some(key_bytes);
     }
     let mut node_map = BTreeMap::new();
-    node_map.insert("l".to_string(), left.map_or(Ipld::Null, Ipld::Link));
-    node_map.insert("e".to_string(), Ipld::List(entries));
-    serde_ipld_dagcbor::to_vec(&Ipld::Map(node_map)).expect("encode MST leaf")
+    node_map.insert("l".to_string(), left.map_or(Value::Null, Value::Link));
+    node_map.insert("e".to_string(), Value::Array(entries));
+    petrel_core::to_dag_cbor(&Value::Object(node_map)).expect("encode MST leaf")
 }
 
 #[cfg(test)]
@@ -1513,19 +1541,19 @@ fn push_uvarint_usize(out: &mut Vec<u8>, mut val: usize) {
 #[cfg(test)]
 pub(crate) fn encode_car_v1(roots: &[Cid], sections: &[(Cid, Vec<u8>)]) -> Vec<u8> {
     let mut hdr_map = BTreeMap::new();
-    hdr_map.insert("version".to_string(), Ipld::Integer(1));
+    hdr_map.insert("version".to_string(), Value::Integer(1));
     hdr_map.insert(
         "roots".to_string(),
-        Ipld::List(roots.iter().copied().map(Ipld::Link).collect()),
+        Value::Array(roots.iter().cloned().map(Value::Link).collect()),
     );
-    let hdr_bytes = serde_ipld_dagcbor::to_vec(&Ipld::Map(hdr_map)).expect("encode CARv1 header");
+    let hdr_bytes = petrel_core::to_dag_cbor(&Value::Object(hdr_map)).expect("encode CARv1 header");
     let mut out = Vec::new();
     push_uvarint_usize(&mut out, hdr_bytes.len());
     out.extend_from_slice(&hdr_bytes);
     for (cid, block) in sections {
-        let cid_bytes = cid.to_bytes();
+        let cid_bytes = cid.as_bytes();
         push_uvarint_usize(&mut out, cid_bytes.len() + block.len());
-        out.extend_from_slice(&cid_bytes);
+        out.extend_from_slice(cid_bytes);
         out.extend_from_slice(block);
     }
     out
