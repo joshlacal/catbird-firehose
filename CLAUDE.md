@@ -18,6 +18,17 @@ Cargo workspace that connects to Bluesky's AT Protocol firehose, fans events out
 
 ## Build Commands
 
+Petrel and PetrelCatbird are sibling path checkouts (`../Petrel`, `../PetrelCatbird`). Before any
+build that will be deployed, verify they are exactly the pinned commits with no local changes; the
+check fails closed otherwise:
+
+```bash
+./scripts/check-canonical-sibling-provenance.sh   # pins: scripts/canonical-sibling-provenance.env
+```
+
+CI (`.github/workflows/ci.yml`) clones the siblings at those pins and runs the check, `cargo fmt
+--check`, `cargo clippy -D warnings` and `cargo test --workspace --locked`.
+
 ```bash
 cargo build                        # Build all crates
 cargo check                        # Type-check without codegen
@@ -52,7 +63,7 @@ The binary (`src/main.rs`) also spawns:
 
 ## Key Dependencies
 
-- **Petrel Rust** -- AT Protocol SDK, as sibling path checkouts `../Petrel` (pinned `cd6dda0d`) and `../PetrelCatbird` (pinned `7658265c`):
+- **Petrel Rust** -- AT Protocol SDK, as sibling path checkouts `../Petrel` and `../PetrelCatbird`, pinned in `scripts/canonical-sibling-provenance.env`:
   - `petrel-firehose` -- `subscribeRepos` subscription (reconnect, backoff, cursor acknowledgement), `RelayEvent` (the broadcast payload), CAR parsing
   - `petrel-core` -- CIDs, the data-model `Value`, strict canonical DAG-CBOR
   - `petrel-catbird` -- generated `blue.catbird.*` record types (witness: `chat.device`, `labyrinth.mailboxKeys`)
