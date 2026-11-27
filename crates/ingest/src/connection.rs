@@ -20,6 +20,9 @@ use tracing::{debug, error, info, warn};
 use url::Url;
 
 use crate::cursor::{CursorStore, PgCursorStore};
+use crate::metrics::{
+    record_frame_dropped, DROPPED_MALFORMED, DROPPED_OVERSIZE_SKIPPED, DROPPED_UNDECODABLE,
+};
 
 type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
@@ -56,10 +59,12 @@ pub async fn run_firehose_ingest(
 /// - reconnects resume from the latest acknowledged seq held in memory, not the periodic
 ///   checkpoint, so events already dispatched are not replayed;
 /// - the checkpoint store is read once at startup and written when an acknowledged seq is a
-///   multiple of [`CURSOR_CHECKPOINT_EVERY`];
-/// - a malformed frame is skipped on the open connection (never a reconnect);
-/// - after [`MAX_RECONNECTS`] consecutive connection attempts without a delivered event the
-///   loop returns an error.
+///   multiple of [`CURSOR_CHECKPOINT_EVERY`], and immediately after an oversize-frame skip so a
+///   restart does not re-hit the frame;
+/// - a malformed frame is skipped on the open connection (never a reconnect) and counted in
+///   `firehose_ingest_frames_dropped_total`;
+/// - after [`MAX_RECONNECTS`] consecutive connection attempts without a delivered event or a
+///   completed oversize-frame skip the loop returns an error.
 pub async fn run_firehose_ingest_with_store<S: CursorStore>(
     firehose_url: String,
     dispatcher: broadcast::Sender<Arc<RelayEvent>>,
@@ -71,9 +76,10 @@ pub async fn run_firehose_ingest_with_store<S: CursorStore>(
     let url =
         FirehoseEndpoint::subscription_url(&parse_ws_url(&firehose_url)?, SUBSCRIBE_REPOS_NSID);
     let attempts = Arc::new(AtomicU32::new(0));
+    let checkpoint = Arc::new(CheckpointCursorStorage::new(cursor_store));
     let subscription = FirehoseSubscription::new(subscription_configuration(
         url,
-        Arc::new(CheckpointCursorStorage::new(cursor_store)),
+        Arc::clone(&checkpoint) as Arc<dyn FirehoseCursorStorage>,
         Arc::clone(&attempts),
     ));
 
@@ -145,6 +151,14 @@ pub async fn run_firehose_ingest_with_store<S: CursorStore>(
                     error!(error = %err, "Failed to move cursor past oversize frame");
                     return Err(anyhow!("cannot move cursor past oversize frame: {err}"));
                 }
+                record_frame_dropped(DROPPED_OVERSIZE_SKIPPED);
+                // Persist the skip now: the periodic checkpoint may be up to 99 seqs behind,
+                // and a restart from there would hit the same frame again.
+                checkpoint.persist_now(skip_to).await;
+                // The skip is progress. The oversize attempts that led to it must not count
+                // against the reconnect budget, or a few consecutive oversize frames would
+                // stop ingest.
+                attempts.store(0, Ordering::SeqCst);
                 // The stream already backed off between the oversize attempts.
                 continue 'outer;
             }
@@ -241,6 +255,7 @@ async fn skip_ignored_frame(
                 "Skipping malformed firehose frame: {}",
                 reason
             );
+            record_frame_dropped(DROPPED_MALFORMED);
         }
         IgnoredFrameReason::UndecodablePayload(reason) => {
             warn!(
@@ -249,6 +264,7 @@ async fn skip_ignored_frame(
                 "Skipping undecodable firehose event: {}",
                 reason
             );
+            record_frame_dropped(DROPPED_UNDECODABLE);
             if let Some(seq) = frame.sequence {
                 acknowledge(subscription, seq).await;
             }
@@ -296,6 +312,19 @@ impl<S> CheckpointCursorStorage<S> {
 
     fn latest(&self) -> Option<i64> {
         *self.latest.lock().expect("cursor lock")
+    }
+}
+
+impl<S: CursorStore> CheckpointCursorStorage<S> {
+    /// Writes `cursor` to the durable checkpoint now, unless the periodic checkpoint already
+    /// wrote it. Failures are logged, as for periodic checkpoints.
+    async fn persist_now(&self, cursor: i64) {
+        if cursor % CURSOR_CHECKPOINT_EVERY == 0 {
+            return;
+        }
+        if let Err(err) = self.store.save(cursor).await {
+            error!(cursor, "Failed to persist cursor: {}", err);
+        }
     }
 }
 
@@ -538,5 +567,16 @@ mod tests {
         assert_eq!(storage.load_cursor().await.unwrap(), Some(201));
         assert_eq!(store.saves(), vec![200]);
         assert_eq!(store.current(), Some(200));
+    }
+
+    #[tokio::test]
+    async fn persist_now_writes_off_checkpoint_seqs_once() {
+        let store = Arc::new(MemoryCursorStore::with_cursor(100));
+        let storage = CheckpointCursorStorage::new(store.clone());
+        storage.save_cursor(102).await.unwrap();
+        storage.persist_now(102).await;
+        storage.save_cursor(200).await.unwrap();
+        storage.persist_now(200).await;
+        assert_eq!(store.saves(), vec![102, 200]);
     }
 }

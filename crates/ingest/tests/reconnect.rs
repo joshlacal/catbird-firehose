@@ -8,7 +8,9 @@
 use std::{collections::BTreeMap, sync::Arc, time::Duration};
 
 use catbird_firehose_ingest::{
-    connection::run_firehose_ingest_with_store, cursor::MemoryCursorStore,
+    connection::run_firehose_ingest_with_store,
+    cursor::MemoryCursorStore,
+    metrics::{frames_dropped, DROPPED_MALFORMED, DROPPED_OVERSIZE_SKIPPED},
 };
 use futures::SinkExt;
 use petrel_core::{dagcbor, Cid, Value};
@@ -247,6 +249,7 @@ async fn immediately_closed_streams_back_off_before_reconnecting() {
 /// connection: no reconnect, and the following commit is still delivered.
 #[tokio::test]
 async fn non_canonical_frame_is_skipped_without_reconnecting() {
+    let dropped_before = frames_dropped(DROPPED_MALFORMED);
     let cursor = seeded_cursor();
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let endpoint = format!("ws://{}", listener.local_addr().unwrap());
@@ -294,6 +297,11 @@ async fn non_canonical_frame_is_skipped_without_reconnecting() {
     relay.abort();
 
     assert_eq!(received, [101, 102]);
+    // Counters are process-wide and tests run concurrently, so only a lower bound holds.
+    assert!(
+        frames_dropped(DROPPED_MALFORMED) > dropped_before,
+        "a dropped malformed frame must be counted"
+    );
     assert!(observed_connections
         .recv()
         .await
@@ -381,4 +389,70 @@ async fn persistent_oversize_frame_skips_one_sequence() {
         "{uris:?}"
     );
     assert!(uris.last().unwrap().ends_with("?cursor=102"), "{uris:?}");
+}
+
+/// Four consecutive oversize frames (seqs 102-105) each cost three connection attempts.
+/// A completed skip is progress, so it must not draw down the ten-attempt reconnect budget,
+/// and every skip must reach the durable checkpoint at once (none is a multiple of 100), so a
+/// restart resumes past the frames instead of re-hitting them.
+#[tokio::test]
+async fn consecutive_oversize_frames_keep_ingesting_and_persist_each_skip() {
+    let skipped_before = frames_dropped(DROPPED_OVERSIZE_SKIPPED);
+    let cursor = seeded_cursor();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = format!("ws://{}", listener.local_addr().unwrap());
+    let relay = tokio::spawn(async move {
+        let mut sockets = vec![];
+        loop {
+            let (tcp, _) = listener.accept().await.unwrap();
+            let (uri_tx, uri_rx) = std::sync::mpsc::channel();
+            let mut ws = accept_hdr_async(tcp, |request: &Request, response| {
+                uri_tx.send(request.uri().to_string()).unwrap();
+                Ok(response)
+            })
+            .await
+            .unwrap();
+            let uri = uri_rx.recv().unwrap();
+            if uri.ends_with("?cursor=100") {
+                ws.send(Message::Binary(commit_frame(101, "3jzfcijpj2z2a")))
+                    .await
+                    .unwrap();
+            }
+            if uri.ends_with("?cursor=105") {
+                ws.send(Message::Binary(commit_frame(106, "3jzfcijpj2z2f")))
+                    .await
+                    .unwrap();
+            } else {
+                // Larger than the 5 MB transport limit.
+                let _ = ws.send(Message::Binary(vec![0; 5_000_100])).await;
+            }
+            sockets.push(ws);
+        }
+    });
+    let (dispatcher, mut receiver) = broadcast::channel(16);
+    let (stop, shutdown) = watch::channel(false);
+    let ingest = tokio::spawn(run_firehose_ingest_with_store(
+        endpoint,
+        dispatcher,
+        cursor.clone(),
+        shutdown,
+    ));
+
+    assert_eq!(next_seq(&mut receiver).await, 101);
+    let after_skips = timeout(Duration::from_secs(60), receiver.recv()).await;
+    // Ingest may already have exited (the failure this test guards against).
+    let _ = stop.send(true);
+    let ingest_result = timeout(Duration::from_secs(2), ingest).await;
+    relay.abort();
+
+    let after_skips = after_skips
+        .expect("ingest must keep going past four consecutive oversize frames")
+        .unwrap();
+    match &*after_skips {
+        RelayEvent::Commit(commit) => assert_eq!(commit.seq, 106),
+        other => panic!("unexpected event: {other:?}"),
+    }
+    ingest_result.unwrap().unwrap().unwrap();
+    assert_eq!(cursor.saves(), vec![102, 103, 104, 105]);
+    assert!(frames_dropped(DROPPED_OVERSIZE_SKIPPED) >= skipped_before + 4);
 }
