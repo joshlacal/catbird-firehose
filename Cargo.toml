@@ -112,7 +112,6 @@ tracing-subscriber = { workspace = true }
 anyhow = { workspace = true }
 dotenv = { workspace = true }
 num_cpus = { workspace = true }
-jacquard-api = { workspace = true }
-jacquard-common = { workspace = true }
+petrel-firehose = { workspace = true }
 futures = { workspace = true }
 url = { workspace = true }

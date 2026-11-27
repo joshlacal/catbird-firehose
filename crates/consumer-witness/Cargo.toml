@@ -7,12 +7,11 @@ publish.workspace = true
 
 [dependencies]
 catbird-firehose-fanout = { workspace = true }
-catbird-atproto = { workspace = true }
-jacquard-api = { workspace = true }
 
-# CAR / DAG-CBOR parsing
-ipld-core = { workspace = true }
-serde_ipld_dagcbor = { workspace = true }
+# AT Protocol data model, firehose events, Catbird overlay records
+petrel-core = { workspace = true }
+petrel-firehose = { workspace = true }
+petrel-catbird = { workspace = true }
 
 # Async & DB
 tokio = { workspace = true }
@@ -42,7 +41,5 @@ prometheus = { workspace = true }
 lazy_static = { workspace = true }
 
 [dev-dependencies]
-atrium-repo = { workspace = true }
 uuid = { workspace = true }
-jacquard-common = { workspace = true }
 rand = { workspace = true }

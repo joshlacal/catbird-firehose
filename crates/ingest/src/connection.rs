@@ -1,33 +1,42 @@
-use std::sync::Arc;
+use std::fmt;
+use std::future::Future;
+use std::pin::Pin;
+use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::{anyhow, Result};
 use futures::StreamExt;
-use jacquard_common::deps::fluent_uri::Uri;
-use jacquard_common::stream::{StreamError, StreamErrorKind};
-use jacquard_common::websocket::tungstenite_client::TungsteniteClient;
-use jacquard_common::xrpc::subscription::SubscriptionExt;
+use petrel_firehose::{
+    FirehoseBackoffConfiguration, FirehoseCursorStorage, FirehoseEndpoint, FirehoseStreamError,
+    FirehoseSubscription, FirehoseSubscriptionConfiguration, FirehoseSubscriptionError,
+    FirehoseSubscriptionEvent, FirehoseWebSocketOptions, FirehoseWebSocketSession,
+    FirehoseWebSocketSessionFactory, IgnoredFrameReason, RelayEvent, TungsteniteWebSocketFactory,
+};
 use sqlx::{Pool, Postgres};
 use tokio::sync::broadcast;
 use tokio::sync::watch;
 use tracing::{debug, error, info, warn};
 use url::Url;
 
-use jacquard_api::com_atproto::sync::subscribe_repos::{
-    SubscribeRepos, SubscribeReposMessage, SubscribeReposStream,
-};
-
 use crate::cursor::{CursorStore, PgCursorStore};
 
-const MAX_RECONNECTS: u32 = 10;
-const HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(60);
+type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
-/// Run the firehose ingest loop. Connects to the ATProto firehose via jacquard,
-/// parses messages into owned `SubscribeReposMessage`, and broadcasts
-/// them to all consumers via the provided `broadcast::Sender`.
+/// Consecutive connection attempts without a delivered event before ingest gives up.
+const MAX_RECONNECTS: u32 = 10;
+/// A connection that delivers no message for this long is dropped and reopened.
+const HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(60);
+/// The persisted cursor is a checkpoint, written when an acknowledged seq is a multiple of this.
+const CURSOR_CHECKPOINT_EVERY: i64 = 100;
+const SUBSCRIBE_REPOS_NSID: &str = "com.atproto.sync.subscribeRepos";
+const MAX_RECONNECTS_MESSAGE: &str = "max firehose reconnection attempts reached";
+
+/// Run the firehose ingest loop. Subscribes to `com.atproto.sync.subscribeRepos` with Petrel's
+/// firehose client and broadcasts every decoded event to all consumers via `dispatcher`.
 pub async fn run_firehose_ingest(
     firehose_url: String,
-    dispatcher: broadcast::Sender<Arc<SubscribeReposMessage>>,
+    dispatcher: broadcast::Sender<Arc<RelayEvent>>,
     db_pool: Pool<Postgres>,
     shutdown: watch::Receiver<bool>,
 ) -> Result<()> {
@@ -41,132 +50,55 @@ pub async fn run_firehose_ingest(
 }
 
 /// [`run_firehose_ingest`] with an explicit cursor checkpoint store.
+///
+/// Delivery semantics (unchanged from the Jacquard implementation):
+/// - an event's seq is acknowledged once it has been handed to at least one consumer;
+/// - reconnects resume from the latest acknowledged seq held in memory, not the periodic
+///   checkpoint, so events already dispatched are not replayed;
+/// - the checkpoint store is read once at startup and written when an acknowledged seq is a
+///   multiple of [`CURSOR_CHECKPOINT_EVERY`];
+/// - a malformed frame is skipped on the open connection (never a reconnect);
+/// - after [`MAX_RECONNECTS`] consecutive connection attempts without a delivered event the
+///   loop returns an error.
 pub async fn run_firehose_ingest_with_store<S: CursorStore>(
     firehose_url: String,
-    dispatcher: broadcast::Sender<Arc<SubscribeReposMessage>>,
+    dispatcher: broadcast::Sender<Arc<RelayEvent>>,
     cursor_store: S,
     mut shutdown: watch::Receiver<bool>,
 ) -> Result<()> {
     info!("Starting firehose ingest");
 
-    let mut reconnect_delay = 1u64;
-    let mut reconnect_attempts = 0u32;
-    // The persisted cursor is only a periodic checkpoint. Reading it again on
-    // each reconnect replays events already dispatched since that checkpoint.
-    let mut last_cursor = match cursor_store.load().await {
-        Ok(c) => c,
-        Err(e) => {
-            error!("Failed to get last cursor: {}", e);
-            None
-        }
-    };
+    let url =
+        FirehoseEndpoint::subscription_url(&parse_ws_url(&firehose_url)?, SUBSCRIBE_REPOS_NSID);
+    let attempts = Arc::new(AtomicU32::new(0));
+    let subscription = FirehoseSubscription::new(subscription_configuration(
+        url,
+        Arc::new(CheckpointCursorStorage::new(cursor_store)),
+        Arc::clone(&attempts),
+    ));
 
     'outer: loop {
-        info!("Connecting to firehose, cursor: {:?}", last_cursor);
-
-        let base_url = parse_ws_url(&firehose_url)?;
-        let ws_client = TungsteniteClient::new();
-
-        let params = SubscribeRepos::new().cursor(last_cursor).build();
-
-        let subscription: jacquard_common::xrpc::subscription::SubscriptionStream<
-            SubscribeReposStream,
-        > = match ws_client.subscription(base_url).subscribe(&params).await {
-            Ok(sub) => sub,
-            Err(e) => {
-                error!("Failed to connect to firehose: {}", e);
-                reconnect_attempts += 1;
-                if reconnect_attempts >= MAX_RECONNECTS {
-                    return Err(anyhow!("Max reconnection attempts reached"));
-                }
-
-                let delay = Duration::from_secs(reconnect_delay);
-                reconnect_delay = std::cmp::min(reconnect_delay * 2, 60);
-
-                info!(
-                    "Retrying in {}s (attempt {}/{})",
-                    delay.as_secs(),
-                    reconnect_attempts,
-                    MAX_RECONNECTS
-                );
-
-                let should_stop = tokio::select! {
-                    _ = tokio::time::sleep(delay) => false,
-                    changed = shutdown.changed() => changed.is_ok() && *shutdown.borrow(),
-                };
-
-                if should_stop {
-                    info!("Shutdown signal received while reconnecting");
-                    break 'outer;
-                }
-
-                continue 'outer;
-            }
-        };
-
-        info!("Firehose connection established");
-
-        let (_sink, mut stream) = subscription.into_stream();
-        let mut last_activity = tokio::time::Instant::now();
-
-        'inner: loop {
+        let mut stream = subscription.events();
+        let ended = loop {
             tokio::select! {
-                item = stream.next() => {
-                    last_activity = tokio::time::Instant::now();
-
-                    match item {
-                        Some(Ok(message)) => {
-                            let sequence = if let SubscribeReposMessage::Commit(ref commit) = message {
-                                if commit.seq % 5000 == 0 {
-                                    info!("Firehose seq: {}", commit.seq);
-                                }
-                                Some(commit.seq)
-                            } else {
-                                None
-                            };
-
-                            // Broadcast to all consumers
-                            let event = Arc::new(message);
-                            if dispatcher.send(event).is_err() {
-                                debug!("No active consumers for broadcast");
-                            } else if let Some(seq) = sequence {
-                                last_cursor = Some(seq);
-                                if seq % 100 == 0 {
-                                    if let Err(e) = cursor_store.save(seq).await {
-                                        error!("Failed to update cursor: {}", e);
-                                    }
-                                }
-                            }
-
-                            // Reset reconnect state on success
-                            reconnect_attempts = 0;
-                            reconnect_delay = 1;
-                        }
-                        Some(Err(e)) => {
-                            if matches!(e.kind(), StreamErrorKind::Decode) {
-                                // Jacquard has consumed this individual WebSocket
-                                // frame. The connection remains usable; reconnecting
-                                // here replays the preceding valid events forever.
-                                warn!(cursor = ?last_cursor, "Skipping malformed firehose frame: {}", e);
-                                continue 'inner;
-                            }
-                            if is_closed_error(&e) {
-                                warn!("Firehose stream closed, reconnecting...");
-                            } else {
-                                error!("Firehose stream error: {}", e);
-                            }
-                            break 'inner;
-                        }
-                        None => {
-                            warn!("Firehose stream ended, reconnecting...");
-                            break 'inner;
-                        }
+                item = stream.next() => match item {
+                    Some(Ok(FirehoseSubscriptionEvent::Event(event))) => {
+                        attempts.store(0, Ordering::SeqCst);
+                        dispatch(&subscription, &dispatcher, event).await;
                     }
-                }
-                _ = tokio::time::sleep_until(last_activity + HEARTBEAT_TIMEOUT) => {
-                    warn!("No firehose data for {}s, reconnecting...", HEARTBEAT_TIMEOUT.as_secs());
-                    break 'inner;
-                }
+                    Some(Ok(FirehoseSubscriptionEvent::SequenceGap { expected, received })) => {
+                        attempts.store(0, Ordering::SeqCst);
+                        info!(expected, received, "Firehose sequence gap");
+                    }
+                    Some(Ok(FirehoseSubscriptionEvent::IgnoredFrame(frame))) => {
+                        if !matches!(frame.reason, IgnoredFrameReason::FrameTooLarge) {
+                            attempts.store(0, Ordering::SeqCst);
+                        }
+                        skip_ignored_frame(&subscription, frame).await;
+                    }
+                    Some(Err(err)) => break Some(err),
+                    None => break None,
+                },
                 changed = shutdown.changed() => {
                     if changed.is_ok() && *shutdown.borrow() {
                         info!("Shutdown signal received, stopping firehose ingest");
@@ -174,20 +106,61 @@ pub async fn run_firehose_ingest_with_store<S: CursorStore>(
                     }
                 }
             }
+        };
+        drop(stream);
+
+        match ended {
+            None => warn!("Firehose stream ended, reconnecting..."),
+            Some(FirehoseStreamError::Subscription(
+                FirehoseSubscriptionError::WebSocketTransportUnavailable(message),
+            )) if message == MAX_RECONNECTS_MESSAGE => {
+                return Err(anyhow!("Max reconnection attempts reached"));
+            }
+            Some(FirehoseStreamError::Subscription(
+                FirehoseSubscriptionError::FrameTooLargeAtCursor {
+                    cursor,
+                    attempts: tries,
+                },
+            )) => {
+                // The relay keeps sending a frame we refuse to read. Without moving past it the
+                // stream would fail on every reconnect, so skip one seq (decision log
+                // 2026-11-27 · catbird-firehose · oversize frame policy).
+                let Some(cursor) = cursor else {
+                    error!(
+                        attempts = tries,
+                        "Oversize firehose frame before any decoded event; cannot skip it"
+                    );
+                    return Err(anyhow!(
+                        "firehose frame exceeded maximum size before any decoded event"
+                    ));
+                };
+                let skip_to = cursor.saturating_add(1);
+                error!(
+                    cursor,
+                    skip_to,
+                    attempts = tries,
+                    "ALERT: oversize firehose frame after cursor; skipping one sequence"
+                );
+                if let Err(err) = subscription.acknowledge(skip_to).await {
+                    error!(error = %err, "Failed to move cursor past oversize frame");
+                    return Err(anyhow!("cannot move cursor past oversize frame: {err}"));
+                }
+                // The stream already backed off between the oversize attempts.
+                continue 'outer;
+            }
+            Some(err) => {
+                warn!(error = %err, "Firehose stream error, reconnecting...");
+            }
         }
 
-        // A successful handshake followed by an immediate close is also a
-        // failed connection. Apply the same limits as connection failures.
-        reconnect_attempts += 1;
-        if reconnect_attempts >= MAX_RECONNECTS {
-            return Err(anyhow!("Max reconnection attempts reached"));
-        }
-        let delay = Duration::from_secs(reconnect_delay);
-        reconnect_delay = std::cmp::min(reconnect_delay * 2, 60);
+        // The stream already backs off between transport reconnects; this delay covers
+        // streams that end on a protocol error (regression, server error frame).
+        let attempt = attempts.load(Ordering::SeqCst);
+        let delay = reconnect_delay(attempt);
         warn!(
             "Connection interrupted, retrying in {}s (attempt {}/{})",
             delay.as_secs(),
-            reconnect_attempts,
+            attempt,
             MAX_RECONNECTS
         );
         let should_stop = tokio::select! {
@@ -204,7 +177,246 @@ pub async fn run_firehose_ingest_with_store<S: CursorStore>(
     Ok(())
 }
 
-fn parse_ws_url(url_str: &str) -> Result<Uri<String>> {
+fn subscription_configuration(
+    url: Url,
+    cursor_storage: Arc<dyn FirehoseCursorStorage>,
+    attempts: Arc<AtomicU32>,
+) -> FirehoseSubscriptionConfiguration {
+    let mut config = FirehoseSubscriptionConfiguration::new(url);
+    config.cursor_storage = cursor_storage;
+    config.session_factory = Arc::new(IngestSessionFactory {
+        inner: TungsteniteWebSocketFactory::with_options(FirehoseWebSocketOptions::new()),
+        attempts,
+        idle_timeout: HEARTBEAT_TIMEOUT,
+    });
+    // 1s, 2s, 4s ... 60s without jitter, reset by any delivered frame.
+    config.backoff = FirehoseBackoffConfiguration {
+        initial_delay: Duration::from_secs(1),
+        max_delay: Duration::from_secs(60),
+        multiplier: 2.0,
+        jitter: 0.0,
+    };
+    config.backoff_reset_after_frames = 1;
+    config.auto_acknowledge = false;
+    config.reconnects_on_consumer_too_slow = true;
+    config
+}
+
+fn reconnect_delay(attempt: u32) -> Duration {
+    Duration::from_secs(1u64 << attempt.min(6)).min(Duration::from_secs(60))
+}
+
+async fn dispatch(
+    subscription: &FirehoseSubscription,
+    dispatcher: &broadcast::Sender<Arc<RelayEvent>>,
+    event: RelayEvent,
+) {
+    let sequence = event.sequence();
+    if let (RelayEvent::Commit(commit), Some(seq)) = (&event, sequence) {
+        if seq % 5000 == 0 {
+            info!("Firehose seq: {}", commit.seq);
+        }
+    }
+    if dispatcher.send(Arc::new(event)).is_err() {
+        debug!("No active consumers for broadcast");
+        return;
+    }
+    if let Some(seq) = sequence {
+        acknowledge(subscription, seq).await;
+    }
+}
+
+/// A skipped frame never ends or reconnects the stream. A frame whose seq was decoded is
+/// acknowledged so a later reconnect does not replay it; a malformed frame's seq is only a
+/// best-effort hint and is never trusted as a cursor.
+async fn skip_ignored_frame(
+    subscription: &FirehoseSubscription,
+    frame: petrel_firehose::EventStreamIgnoredFrame,
+) {
+    match &frame.reason {
+        IgnoredFrameReason::MalformedFrame(reason) => {
+            warn!(
+                seq_hint = ?frame.sequence,
+                r#type = ?frame.r#type,
+                "Skipping malformed firehose frame: {}",
+                reason
+            );
+        }
+        IgnoredFrameReason::UndecodablePayload(reason) => {
+            warn!(
+                seq = ?frame.sequence,
+                r#type = ?frame.r#type,
+                "Skipping undecodable firehose event: {}",
+                reason
+            );
+            if let Some(seq) = frame.sequence {
+                acknowledge(subscription, seq).await;
+            }
+        }
+        IgnoredFrameReason::UnknownType | IgnoredFrameReason::UnknownOperation => {
+            debug!(
+                seq = ?frame.sequence,
+                op = frame.operation,
+                r#type = ?frame.r#type,
+                "Skipping firehose frame of unknown kind"
+            );
+            if let Some(seq) = frame.sequence {
+                acknowledge(subscription, seq).await;
+            }
+        }
+        IgnoredFrameReason::FrameTooLarge => {
+            warn!("Firehose frame exceeded the maximum message size; reconnecting");
+        }
+    }
+}
+
+async fn acknowledge(subscription: &FirehoseSubscription, seq: i64) {
+    if let Err(err) = subscription.acknowledge(seq).await {
+        warn!(seq, error = %err, "Failed to acknowledge firehose cursor");
+    }
+}
+
+/// Petrel cursor storage over the ingest checkpoint store.
+///
+/// Holds the latest acknowledged seq in memory (what every reconnect resumes from) and writes
+/// the durable checkpoint only every [`CURSOR_CHECKPOINT_EVERY`] seqs. Checkpoint failures are
+/// logged and do not stop ingest; an unreadable checkpoint starts from the live tip.
+struct CheckpointCursorStorage<S> {
+    store: S,
+    latest: Mutex<Option<i64>>,
+}
+
+impl<S> CheckpointCursorStorage<S> {
+    fn new(store: S) -> Self {
+        Self {
+            store,
+            latest: Mutex::new(None),
+        }
+    }
+
+    fn latest(&self) -> Option<i64> {
+        *self.latest.lock().expect("cursor lock")
+    }
+}
+
+impl<S> fmt::Debug for CheckpointCursorStorage<S> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("CheckpointCursorStorage")
+            .field("latest", &self.latest())
+            .finish_non_exhaustive()
+    }
+}
+
+impl<S: CursorStore> FirehoseCursorStorage for CheckpointCursorStorage<S> {
+    fn load_cursor(&self) -> BoxFuture<'_, Result<Option<i64>, FirehoseSubscriptionError>> {
+        Box::pin(async move {
+            if let Some(latest) = self.latest() {
+                return Ok(Some(latest));
+            }
+            let loaded = match self.store.load().await {
+                Ok(cursor) => cursor,
+                Err(err) => {
+                    error!("Failed to get last cursor: {}", err);
+                    None
+                }
+            };
+            let mut latest = self.latest.lock().expect("cursor lock");
+            if latest.is_none() {
+                *latest = loaded;
+            }
+            Ok(*latest)
+        })
+    }
+
+    fn save_cursor(&self, cursor: i64) -> BoxFuture<'_, Result<(), FirehoseSubscriptionError>> {
+        Box::pin(async move {
+            *self.latest.lock().expect("cursor lock") = Some(cursor);
+            if cursor % CURSOR_CHECKPOINT_EVERY == 0 {
+                if let Err(err) = self.store.save(cursor).await {
+                    error!("Failed to update cursor: {}", err);
+                }
+            }
+            Ok(())
+        })
+    }
+}
+
+/// Session factory that caps consecutive connection attempts and adds an idle timeout.
+#[derive(Debug)]
+struct IngestSessionFactory {
+    inner: TungsteniteWebSocketFactory,
+    /// Connection attempts since the last delivered frame; reset by the ingest loop.
+    attempts: Arc<AtomicU32>,
+    idle_timeout: Duration,
+}
+
+impl FirehoseWebSocketSessionFactory for IngestSessionFactory {
+    fn make_session(
+        &self,
+        url: Url,
+    ) -> BoxFuture<'_, Result<Box<dyn FirehoseWebSocketSession>, FirehoseSubscriptionError>> {
+        Box::pin(async move {
+            let attempt = self.attempts.fetch_add(1, Ordering::SeqCst) + 1;
+            if attempt > MAX_RECONNECTS {
+                error!("Giving up after {} connection attempts", MAX_RECONNECTS);
+                return Err(FirehoseSubscriptionError::WebSocketTransportUnavailable(
+                    MAX_RECONNECTS_MESSAGE.to_string(),
+                ));
+            }
+            info!("Connecting to firehose: {}", url);
+            match self.inner.make_session(url).await {
+                Ok(session) => {
+                    info!("Firehose connection established");
+                    Ok(Box::new(IdleTimeoutSession {
+                        inner: session,
+                        idle_timeout: self.idle_timeout,
+                    }) as Box<dyn FirehoseWebSocketSession>)
+                }
+                Err(err) => {
+                    error!(
+                        "Failed to connect to firehose (attempt {}/{}): {}",
+                        attempt, MAX_RECONNECTS, err
+                    );
+                    Err(err)
+                }
+            }
+        })
+    }
+}
+
+/// Ends a connection that has delivered no message for `idle_timeout` (pings and pongs do
+/// not count), so a stalled relay is reconnected with backoff.
+#[derive(Debug)]
+struct IdleTimeoutSession {
+    inner: Box<dyn FirehoseWebSocketSession>,
+    idle_timeout: Duration,
+}
+
+impl FirehoseWebSocketSession for IdleTimeoutSession {
+    fn receive_message(&self) -> BoxFuture<'_, Result<Vec<u8>, FirehoseSubscriptionError>> {
+        Box::pin(async move {
+            match tokio::time::timeout(self.idle_timeout, self.inner.receive_message()).await {
+                Ok(result) => result,
+                Err(_) => {
+                    warn!(
+                        "No firehose data for {}s, reconnecting...",
+                        self.idle_timeout.as_secs()
+                    );
+                    Err(FirehoseSubscriptionError::Network(format!(
+                        "no firehose data for {}s",
+                        self.idle_timeout.as_secs()
+                    )))
+                }
+            }
+        })
+    }
+
+    fn close(&self) -> BoxFuture<'_, ()> {
+        self.inner.close()
+    }
+}
+
+fn parse_ws_url(url_str: &str) -> Result<Url> {
     if let Some((_, authority_and_path)) = url_str.split_once("://") {
         if authority_and_path.is_empty() || authority_and_path.starts_with('/') {
             return Err(anyhow!("Invalid firehose URL: missing authority"));
@@ -239,18 +451,17 @@ fn parse_ws_url(url_str: &str) -> Result<Uri<String>> {
         return Err(anyhow!("Invalid firehose URL: fragment is not allowed"));
     }
 
-    Uri::parse(parsed.as_str())
-        .map(|uri| uri.to_owned())
-        .map_err(|e| anyhow!("Invalid firehose URI: {}", e))
-}
-
-fn is_closed_error(e: &StreamError) -> bool {
-    matches!(e.kind(), StreamErrorKind::Closed)
+    Ok(parsed)
 }
 
 #[cfg(test)]
 mod tests {
-    use super::parse_ws_url;
+    use std::sync::Arc;
+
+    use petrel_firehose::{FirehoseCursorStorage, FirehoseEndpoint};
+
+    use super::{parse_ws_url, CheckpointCursorStorage, SUBSCRIBE_REPOS_NSID};
+    use crate::cursor::MemoryCursorStore;
 
     #[test]
     fn normalizes_supported_firehose_url_forms() {
@@ -268,6 +479,26 @@ mod tests {
             let uri = parse_ws_url(input)
                 .unwrap_or_else(|error| panic!("expected {input:?} to be valid, got {error}"));
             assert_eq!(uri.as_str(), expected, "input: {input}");
+        }
+    }
+
+    #[test]
+    fn subscription_url_matches_the_previous_endpoint() {
+        for (input, expected) in [
+            (
+                "https://bsky.network",
+                "wss://bsky.network/xrpc/com.atproto.sync.subscribeRepos",
+            ),
+            (
+                "ws://127.0.0.1:8080",
+                "ws://127.0.0.1:8080/xrpc/com.atproto.sync.subscribeRepos",
+            ),
+        ] {
+            let url = FirehoseEndpoint::subscription_url(
+                &parse_ws_url(input).unwrap(),
+                SUBSCRIBE_REPOS_NSID,
+            );
+            assert_eq!(url.as_str(), expected);
         }
     }
 
@@ -294,5 +525,18 @@ mod tests {
                 "expected {input:?} to be rejected"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn checkpoint_storage_resumes_from_memory_and_persists_every_hundredth_seq() {
+        let store = Arc::new(MemoryCursorStore::with_cursor(100));
+        let storage = CheckpointCursorStorage::new(store.clone());
+        assert_eq!(storage.load_cursor().await.unwrap(), Some(100));
+        for seq in [101, 150, 199, 200, 201] {
+            storage.save_cursor(seq).await.unwrap();
+        }
+        assert_eq!(storage.load_cursor().await.unwrap(), Some(201));
+        assert_eq!(store.saves(), vec![200]);
+        assert_eq!(store.current(), Some(200));
     }
 }

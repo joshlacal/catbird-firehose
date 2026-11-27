@@ -6,9 +6,7 @@ license.workspace = true
 publish.workspace = true
 
 [dependencies]
-jacquard = { workspace = true }
-jacquard-common = { workspace = true }
-jacquard-api = { workspace = true }
+petrel-firehose = { workspace = true }
 sqlx = { workspace = true }
 tokio = { workspace = true }
 futures = { workspace = true }
@@ -18,5 +16,5 @@ bytes = { workspace = true }
 url = { workspace = true }
 
 [dev-dependencies]
-ciborium = { workspace = true }
+petrel-core = { workspace = true }
 tokio-tungstenite = "0.24"

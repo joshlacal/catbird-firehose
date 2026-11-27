@@ -13,10 +13,8 @@ use std::sync::Arc;
 
 use anyhow::{anyhow, Result};
 use catbird_firehose_fanout::Consumer;
-use petrel_core::Cid;
 use petrel_firehose::car::DEFAULT_MAX_CAR_BYTES;
-use petrel_firehose::{DiffCarBlockReader, ParsedCarArchive};
-use jacquard_api::com_atproto::sync::subscribe_repos::SubscribeReposMessage;
+use petrel_firehose::{DiffCarBlockReader, ParsedCarArchive, RelayEvent, RelayRepoAction};
 use sqlx::{Pool, Postgres};
 use tokio::sync::{watch, RwLock};
 use tokio::task::JoinHandle;
@@ -136,16 +134,13 @@ impl Consumer for PushConsumer {
         metrics::CONSUMER_DROPPED_EVENTS.inc_by(dropped_events as f64);
     }
 
-    async fn handle_event(&self, event: Arc<SubscribeReposMessage>) -> Result<()> {
+    async fn handle_event(&self, event: Arc<RelayEvent>) -> Result<()> {
         let commit = match event.as_ref() {
-            SubscribeReposMessage::Commit(commit) => commit,
+            RelayEvent::Commit(commit) => commit,
             _ => return Ok(()),
         };
 
-        let has_relevant_ops = commit.ops.iter().any(|op| {
-            let path: &str = op.path.as_ref();
-            is_relevant_path(path)
-        });
+        let has_relevant_ops = commit.ops.iter().any(|op| is_relevant_path(&op.path));
 
         if !has_relevant_ops {
             return Ok(());
@@ -154,15 +149,15 @@ impl Consumer for PushConsumer {
         let car = ParsedCarArchive::parse(&commit.blocks, DEFAULT_MAX_CAR_BYTES, false)
             .map_err(|err| anyhow!("Failed to parse commit CAR: {}", err))?;
 
-        let repo_did = commit.repo.to_string();
+        let repo_did = commit.repo.clone();
 
         for op in &commit.ops {
-            let action: &str = op.action.as_ref();
-            if action != "create" && action != "update" {
+            if !matches!(op.action, RelayRepoAction::Create | RelayRepoAction::Update) {
                 continue;
             }
+            let action = op.action.as_str();
 
-            let path: &str = op.path.as_ref();
+            let path: &str = &op.path;
             if !is_relevant_path(path) {
                 continue;
             }
@@ -171,21 +166,12 @@ impl Consumer for PushConsumer {
                 continue;
             };
 
-            let cid_link = match &op.cid {
-                Some(cid_link) => cid_link,
-                None => continue,
+            let Some(cid) = &op.cid else {
+                continue;
             };
 
-            let cid = match Cid::parse(cid_link.as_str()) {
-                Ok(cid) => cid,
-                Err(err) => {
-                    error!("Invalid CID format: {}", err);
-                    continue;
-                }
-            };
-
-            let Some(record_block) = car.block_bytes(&cid) else {
-                debug!("Record block not found for CID: {}", cid_link);
+            let Some(record_block) = car.block_bytes(cid) else {
+                debug!("Record block not found for CID: {}", cid);
                 continue;
             };
 

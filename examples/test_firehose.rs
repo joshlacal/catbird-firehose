@@ -1,4 +1,4 @@
-//! Quick integration test: connect to bsky.network firehose via jacquard,
+//! Quick integration test: connect to bsky.network firehose via Petrel,
 //! receive events for 10 seconds, and print stats.
 //!
 //! Usage: cargo run --example test_firehose
@@ -8,12 +8,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use futures::StreamExt;
-use jacquard_api::com_atproto::sync::subscribe_repos::{
-    SubscribeRepos, SubscribeReposMessage, SubscribeReposStream,
+use petrel_firehose::{
+    FirehoseSubscription, FirehoseSubscriptionEvent, InMemoryFirehoseCursorStorage, RelayEvent,
 };
-use jacquard_common::deps::fluent_uri::Uri;
-use jacquard_common::websocket::tungstenite_client::TungsteniteClient;
-use jacquard_common::xrpc::subscription::SubscriptionExt;
 use tokio::sync::broadcast;
 
 #[tokio::main]
@@ -27,20 +24,18 @@ async fn main() -> anyhow::Result<()> {
 
     println!("Connecting to firehose: {}", firehose_url);
 
-    let url = Uri::parse(firehose_url.as_str())?.to_owned();
-    let ws_client = TungsteniteClient::new();
-    let params = SubscribeRepos::new().build();
+    let service = url::Url::parse(&firehose_url)?;
+    let subscription = FirehoseSubscription::from_service(
+        &service,
+        Arc::new(InMemoryFirehoseCursorStorage::new()),
+        true,
+    );
+    let mut stream = subscription.events();
 
-    let subscription: jacquard_common::xrpc::subscription::SubscriptionStream<
-        SubscribeReposStream,
-    > = ws_client.subscription(url).subscribe(&params).await?;
-
-    println!("Connected! Receiving events for 10 seconds...\n");
-
-    let (_sink, mut stream) = subscription.into_stream();
+    println!("Receiving events for 10 seconds...\n");
 
     // Also test broadcast fanout
-    let (tx, mut rx1) = broadcast::channel::<Arc<SubscribeReposMessage>>(4096);
+    let (tx, mut rx1) = broadcast::channel::<Arc<RelayEvent>>(4096);
     let mut rx2 = tx.subscribe();
 
     let mut total = 0u64;
@@ -59,15 +54,14 @@ async fn main() -> anyhow::Result<()> {
         tokio::select! {
             item = stream.next() => {
                 match item {
-                    Some(Ok(message)) => {
+                    Some(Ok(FirehoseSubscriptionEvent::Event(message))) => {
                         total += 1;
 
                         match &message {
-                            SubscribeReposMessage::Commit(commit) => {
+                            RelayEvent::Commit(commit) => {
                                 commits += 1;
                                 for op in &commit.ops {
-                                    let path: &str = op.path.as_ref();
-                                    if let Some(col) = path.split('/').next() {
+                                    if let Some(col) = op.path.split('/').next() {
                                         *collections.entry(col.to_string()).or_insert(0) += 1;
                                     }
                                 }
@@ -76,8 +70,8 @@ async fn main() -> anyhow::Result<()> {
                                         commit.repo, commit.seq, commit.ops.len());
                                 }
                             }
-                            SubscribeReposMessage::Identity(_) => identities += 1,
-                            SubscribeReposMessage::Account(_) => accounts += 1,
+                            RelayEvent::Identity(_) => identities += 1,
+                            RelayEvent::Account(_) => accounts += 1,
                             _ => other += 1,
                         }
 
@@ -85,6 +79,8 @@ async fn main() -> anyhow::Result<()> {
                         let event = Arc::new(message);
                         let _ = tx.send(event);
                     }
+                    Some(Ok(FirehoseSubscriptionEvent::SequenceGap { .. }))
+                    | Some(Ok(FirehoseSubscriptionEvent::IgnoredFrame(_))) => other += 1,
                     Some(Err(e)) => {
                         eprintln!("Stream error: {}", e);
                         break;

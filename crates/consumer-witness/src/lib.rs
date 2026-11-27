@@ -21,22 +21,18 @@ pub use verify::{
 };
 
 use std::collections::{HashMap, VecDeque};
-use std::io::Cursor;
 use std::sync::{
     atomic::{AtomicI64, AtomicU64, Ordering},
     Arc, Mutex,
 };
 
 use anyhow::Result;
-use catbird_atproto::generated::blue_catbird::{
+use catbird_firehose_fanout::Consumer;
+use petrel_catbird::generated::blue::catbird::{
     chat::device::Device, labyrinth::mailbox_keys::MailboxKeys,
 };
-use catbird_firehose_fanout::Consumer;
-use ipld_core::{
-    cid::{Cid, Version},
-    ipld::Ipld,
-};
-use jacquard_api::com_atproto::sync::subscribe_repos::SubscribeReposMessage;
+use petrel_core::{Cid, Value};
+use petrel_firehose::{RelayCommitEvent, RelayEvent, RelayRepoAction};
 use sha2::{Digest, Sha256};
 use sqlx::{Pool, Postgres};
 use tracing::{info, warn};
@@ -253,13 +249,13 @@ fn parse_device_block(
     rev: &str,
     block: &[u8],
 ) -> Result<WitnessedDeviceRecord, String> {
-    let parsed: Device = serde_ipld_dagcbor::from_slice(block)
+    let parsed: Device = petrel_core::from_dag_cbor_strict(block)
         .map_err(|e| format!("failed to decode blue.catbird.chat.device CBOR: {e}"))?;
     if parsed.extra_data.as_ref().is_some_and(|m| !m.is_empty()) {
         return Err("unexpected extra fields in blue.catbird.chat.device".to_string());
     }
-    let alg = parsed.algorithm.as_ref();
-    let pubkey = parsed.mls_signature_public_key.as_ref();
+    let alg = parsed.algorithm.as_str();
+    let pubkey = parsed.mls_signature_public_key.0.as_slice();
     if let Err(err) = verify::verify_chat_device_pubkey(alg, pubkey) {
         metrics::WITNESS_VERIFICATION_FAILURES
             .with_label_values(&["invalid_chat_device_pubkey"])
@@ -271,7 +267,7 @@ fn parse_device_block(
         record_cid: cid.to_string(),
         algorithm: alg.to_string(),
         mls_signature_public_key: pubkey.to_vec(),
-        record_created_at: parsed.created_at.as_ref().to_string(),
+        record_created_at: parsed.created_at.as_str().to_string(),
         first_seen_seq: seq,
         first_seen_rev: rev.to_string(),
     })
@@ -286,7 +282,7 @@ fn parse_mailbox_keys_block(
     immutable_pinned: bool,
     block: &[u8],
 ) -> Result<MailboxEpochRecord, String> {
-    let parsed: MailboxKeys = serde_ipld_dagcbor::from_slice(block)
+    let parsed: MailboxKeys = petrel_core::from_dag_cbor_strict(block)
         .map_err(|e| format!("failed to decode blue.catbird.labyrinth.mailboxKeys CBOR: {e}"))?;
     if parsed.extra_data.as_ref().is_some_and(|m| !m.is_empty())
         || parsed
@@ -304,35 +300,41 @@ fn parse_mailbox_keys_block(
             cur.epoch_number, MAX_MAILBOX_EPOCH_NUMBER
         ));
     }
-    if cur.epoch_head.len() != 32 {
+    if cur.epoch_head.0.len() != 32 {
         return Err(format!(
             "epochHead must be 32 bytes, got {}",
-            cur.epoch_head.len()
+            cur.epoch_head.0.len()
         ));
     }
     if let Some(prev_head) = cur.previous_epoch_head.as_ref() {
-        if prev_head.len() != 32 {
+        if prev_head.0.len() != 32 {
             return Err(format!(
                 "previousEpochHead must be 32 bytes, got {}",
-                prev_head.len()
+                prev_head.0.len()
             ));
         }
     }
-    if cur.signing_pubkey.len() != 32 || cur.auth_pubkey.len() != 32 || cur.members_hash.len() != 32
+    if cur.signing_pubkey.0.len() != 32
+        || cur.auth_pubkey.0.len() != 32
+        || cur.members_hash.0.len() != 32
     {
         return Err("signingPubkey, authPubkey, and membersHash must each be 32 bytes".to_string());
     }
-    if cur.encryption_pubkey.len() != 1216 {
+    if cur.encryption_pubkey.0.len() != 1216 {
         return Err(format!(
             "encryptionPubkey must be 1216 bytes (X25519 || ML-KEM-768), got {}",
-            cur.encryption_pubkey.len()
+            cur.encryption_pubkey.0.len()
         ));
     }
-    let self_msg = [verify::LABYRINTH_SELF_SIG_PREFIX, cur.epoch_head.as_ref()].concat();
+    let self_msg = [
+        verify::LABYRINTH_SELF_SIG_PREFIX,
+        cur.epoch_head.0.as_slice(),
+    ]
+    .concat();
     if let Err(err) = verify::verify_labyrinth_xeddsa(
-        cur.signing_pubkey.as_ref(),
+        cur.signing_pubkey.0.as_slice(),
         &self_msg,
-        cur.self_sig.as_ref(),
+        cur.self_sig.0.as_slice(),
         "selfSig",
     ) {
         metrics::WITNESS_VERIFICATION_FAILURES
@@ -342,9 +344,9 @@ fn parse_mailbox_keys_block(
     }
     if let Err(err) = verify::verify_labyrinth_ed25519_attestation(
         actor_did,
-        cur.epoch_head.as_ref(),
-        cur.attestation.transport_pubkey.as_ref(),
-        cur.attestation.sig.as_ref(),
+        cur.epoch_head.0.as_slice(),
+        cur.attestation.transport_pubkey.0.as_slice(),
+        cur.attestation.sig.0.as_slice(),
     ) {
         metrics::WITNESS_VERIFICATION_FAILURES
             .with_label_values(&["invalid_mailbox_attestation_sig"])
@@ -352,7 +354,7 @@ fn parse_mailbox_keys_block(
         return Err(err);
     }
     if let Some(prev_sig) = cur.prev_sig.as_ref() {
-        if let Err(err) = verify::check_xeddsa_sig_canonical(prev_sig.as_ref(), "prevSig") {
+        if let Err(err) = verify::check_xeddsa_sig_canonical(prev_sig.0.as_slice(), "prevSig") {
             metrics::WITNESS_VERIFICATION_FAILURES
                 .with_label_values(&["invalid_mailbox_prev_sig"])
                 .inc();
@@ -364,15 +366,15 @@ fn parse_mailbox_keys_block(
         epoch_number: cur.epoch_number,
         rkey: rkey.to_string(),
         record_cid: cid.to_string(),
-        epoch_head: cur.epoch_head.to_vec(),
-        previous_epoch_head: cur.previous_epoch_head.as_ref().map(|b| b.to_vec()),
-        signing_pubkey: cur.signing_pubkey.to_vec(),
-        auth_pubkey: cur.auth_pubkey.to_vec(),
-        encryption_pubkey: cur.encryption_pubkey.to_vec(),
-        members_hash: cur.members_hash.to_vec(),
-        self_sig: cur.self_sig.to_vec(),
-        prev_sig: cur.prev_sig.as_ref().map(|b| b.to_vec()),
-        backend: parsed.backend.as_ref().map(|b| b.as_str().to_string()),
+        epoch_head: cur.epoch_head.0.clone(),
+        previous_epoch_head: cur.previous_epoch_head.as_ref().map(|b| b.0.clone()),
+        signing_pubkey: cur.signing_pubkey.0.clone(),
+        auth_pubkey: cur.auth_pubkey.0.clone(),
+        encryption_pubkey: cur.encryption_pubkey.0.clone(),
+        members_hash: cur.members_hash.0.clone(),
+        self_sig: cur.self_sig.0.clone(),
+        prev_sig: cur.prev_sig.as_ref().map(|b| b.0.clone()),
+        backend: parsed.backend.clone(),
         immutable_pinned,
         chain_verified: cur.epoch_number == 0,
         first_seen_seq: seq,
@@ -1574,20 +1576,20 @@ impl WitnessConsumer {
     /// Durably withhold a whole commit the witness did not witness.
     async fn record_commit_unverified(
         &self,
-        commit: &jacquard_api::com_atproto::sync::subscribe_repos::Commit,
+        commit: &RelayCommitEvent,
         reason: &str,
         detail: String,
     ) {
         let rec = UnverifiedCommitRecord {
-            actor_did: commit.repo.as_ref().to_string(),
+            actor_did: commit.repo.clone(),
             seq: commit.seq,
-            commit_rev: commit.rev.as_ref().to_string(),
-            commit_cid: commit.commit.to_ipld().ok().map(|cid| cid.to_string()),
+            commit_rev: commit.rev.clone(),
+            commit_cid: Some(commit.commit_cid.to_string()),
             op_path: COMMIT_LEVEL_OP_PATH.to_string(),
             claimed_paths: commit
                 .ops
                 .iter()
-                .map(|op| op.path.as_ref())
+                .map(|op| op.path.as_str())
                 .filter(|path| is_transparency_path(path))
                 .map(str::to_string)
                 .collect(),
@@ -1636,16 +1638,13 @@ impl WitnessConsumer {
     /// transparency op in `commit` before any witness state is mutated.
     pub async fn verify_and_extract_observed_commit(
         &self,
-        commit: &jacquard_api::com_atproto::sync::subscribe_repos::Commit,
+        commit: &RelayCommitEvent,
     ) -> std::result::Result<ObservedCommit, CommitVerifyError> {
         if commit.blocks.is_empty() {
             return Err(CommitVerifyError::EmptyCar);
         }
 
-        let commit_cid = commit
-            .commit
-            .to_ipld()
-            .map_err(|e| CommitVerifyError::InvalidCommitCid(e.to_string()))?;
+        let commit_cid = commit.commit_cid.clone();
         if !is_valid_dag_cbor_sha256_cid_v1(&commit_cid) {
             return Err(CommitVerifyError::InvalidCommitCid(format!(
                 "commit CID {commit_cid} is not CIDv1(dag-cbor, sha2-256)"
@@ -1654,7 +1653,7 @@ impl WitnessConsumer {
 
         let (roots, car_blocks) =
             parse_bounded_car_v1(&commit.blocks).map_err(CommitVerifyError::InvalidCar)?;
-        if roots.as_slice() != [commit_cid] {
+        if roots.as_slice() != std::slice::from_ref(&commit_cid) {
             return Err(CommitVerifyError::CommitRootMismatch(format!(
                 "CAR header roots {roots:?} do not match frame commit CID {commit_cid}"
             )));
@@ -1665,8 +1664,8 @@ impl WitnessConsumer {
             .copied()
             .ok_or_else(|| CommitVerifyError::MissingCommitBlock(commit_cid.to_string()))?;
 
-        let actor_did: &str = commit.repo.as_ref();
-        let rev_str: &str = commit.rev.as_ref();
+        let actor_did: &str = &commit.repo;
+        let rev_str: &str = &commit.rev;
 
         let mut key = self
             .key_resolver
@@ -1695,30 +1694,30 @@ impl WitnessConsumer {
 
         let mut ops = Vec::with_capacity(commit.ops.len());
         for op in &commit.ops {
-            let path: &str = op.path.as_ref();
+            let path: &str = &op.path;
             if !is_transparency_path(path) {
                 continue;
             }
-            let action: &str = op.action.as_ref();
-            match action {
-                "create" | "update" => {
-                    let cid_link = op.cid.as_ref().ok_or_else(|| {
+            let action = op.action.as_str();
+            match op.action {
+                RelayRepoAction::Create | RelayRepoAction::Update => {
+                    let op_cid = op.cid.clone().ok_or_else(|| {
                         CommitVerifyError::InvalidOpCid(format!(
                             "{action} op on {path} missing required CID"
                         ))
                     })?;
-                    let op_cid = cid_link
-                        .to_ipld()
-                        .map_err(|e| CommitVerifyError::InvalidOpCid(e.to_string()))?;
                     if !is_valid_dag_cbor_sha256_cid_v1(&op_cid) {
                         return Err(CommitVerifyError::InvalidOpCid(format!(
                             "op CID {op_cid} on {path} is not CIDv1(dag-cbor, sha2-256)"
                         )));
                     }
-                    let mst_val =
-                        verify::verify_mst_key_lookup(&car_blocks, mst_root_cid, path.as_bytes())
-                            .map_err(CommitVerifyError::MstProofFailed)?;
-                    if mst_val != Some(op_cid) {
+                    let mst_val = verify::verify_mst_key_lookup(
+                        &car_blocks,
+                        mst_root_cid.clone(),
+                        path.as_bytes(),
+                    )
+                    .map_err(CommitVerifyError::MstProofFailed)?;
+                    if mst_val.as_ref() != Some(&op_cid) {
                         return Err(CommitVerifyError::MstProofFailed(format!(
                             "MST lookup for {path} resolved to {mst_val:?}, expected Some({op_cid})"
                         )));
@@ -1740,15 +1739,18 @@ impl WitnessConsumer {
                         block: Some(raw_block.to_vec()),
                     });
                 }
-                "delete" => {
+                RelayRepoAction::Delete => {
                     if op.cid.is_some() {
                         return Err(CommitVerifyError::InvalidOpCid(format!(
                             "delete op on {path} must not carry a CID"
                         )));
                     }
-                    let mst_val =
-                        verify::verify_mst_key_lookup(&car_blocks, mst_root_cid, path.as_bytes())
-                            .map_err(CommitVerifyError::MstProofFailed)?;
+                    let mst_val = verify::verify_mst_key_lookup(
+                        &car_blocks,
+                        mst_root_cid.clone(),
+                        path.as_bytes(),
+                    )
+                    .map_err(CommitVerifyError::MstProofFailed)?;
                     if mst_val.is_some() {
                         return Err(CommitVerifyError::MstProofFailed(format!(
                             "delete op on {path} contradicted by MST inclusion {mst_val:?}"
@@ -1760,11 +1762,6 @@ impl WitnessConsumer {
                         cid: None,
                         block: None,
                     });
-                }
-                other => {
-                    return Err(CommitVerifyError::MstProofFailed(format!(
-                        "unsupported repo op action '{other}' on {path}"
-                    )));
                 }
             }
         }
@@ -1803,11 +1800,32 @@ fn read_uvarint_usize(buf: &[u8]) -> Result<(usize, usize), &'static str> {
     Err("CAR varint exceeds 9 bytes")
 }
 
+/// Reads the binary CID that starts a CAR section, returning it and its length.
+///
+/// Only CIDv1 is representable: a CIDv0 section is rejected here instead of by the later
+/// CIDv1(dag-cbor, sha2-256) check, with the same outcome.
+fn read_car_section_cid(section: &[u8]) -> Result<(Cid, usize), String> {
+    let mut pos = 0usize;
+    for _field in ["version", "codec", "multihash code"] {
+        let rest = section.get(pos..).ok_or("truncated CID")?;
+        let (_, len) = read_uvarint_usize(rest)?;
+        pos += len;
+    }
+    let rest = section.get(pos..).ok_or("truncated CID")?;
+    let (digest_len, len) = read_uvarint_usize(rest)?;
+    let end = pos
+        .checked_add(len)
+        .and_then(|p| p.checked_add(digest_len))
+        .filter(|&end| end <= section.len())
+        .ok_or("truncated CID digest")?;
+    let cid = Cid::from_bytes(&section[..end]).map_err(|e| e.to_string())?;
+    Ok((cid, end))
+}
+
 fn is_valid_dag_cbor_sha256_cid_v1(cid: &Cid) -> bool {
-    cid.version() == Version::V1
-        && cid.codec() == DAG_CBOR_CODEC
-        && cid.hash().code() == SHA2_256_CODE
-        && cid.hash().digest().len() == SHA2_256_DIGEST_LEN
+    cid.codec() == DAG_CBOR_CODEC
+        && cid.hash_code() == SHA2_256_CODE
+        && cid.digest().len() == SHA2_256_DIGEST_LEN
 }
 
 type ParsedCarV1<'a> = (Vec<Cid>, HashMap<Cid, &'a [u8]>);
@@ -1845,22 +1863,22 @@ fn parse_bounded_car_v1(car_bytes: &[u8]) -> Result<ParsedCarV1<'_>, String> {
     verify::verify_canonical_dagcbor(hdr_slice)
         .map_err(|e| format!("non-canonical CARv1 header DAG-CBOR: {e}"))?;
 
-    let hdr_ipld: Ipld = serde_ipld_dagcbor::from_slice(hdr_slice)
+    let hdr_value: Value = petrel_core::from_dag_cbor(hdr_slice)
         .map_err(|e| format!("invalid CARv1 DAG-CBOR header: {e}"))?;
-    let Ipld::Map(hdr_map) = hdr_ipld else {
+    let Value::Object(hdr_map) = hdr_value else {
         return Err("CAR header must be a DAG-CBOR map".to_string());
     };
-    if hdr_map.len() != 2 || hdr_map.get("version") != Some(&Ipld::Integer(1)) {
+    if hdr_map.len() != 2 || hdr_map.get("version") != Some(&Value::Integer(1)) {
         return Err("CAR header must contain version=1 and roots".to_string());
     }
     let roots = match hdr_map.get("roots") {
-        Some(Ipld::List(list)) if list.len() <= 64 => {
+        Some(Value::Array(list)) if list.len() <= 64 => {
             let mut cids = Vec::with_capacity(list.len());
             for item in list {
-                let Ipld::Link(cid) = item else {
+                let Value::Link(cid) = item else {
                     return Err("CAR header roots entries must be CID links".to_string());
                 };
-                cids.push(*cid);
+                cids.push(cid.clone());
             }
             cids
         }
@@ -1899,14 +1917,8 @@ fn parse_bounded_car_v1(car_bytes: &[u8]) -> Result<ParsedCarV1<'_>, String> {
             .ok_or_else(|| "CAR section exceeds archive bounds".to_string())?;
         pos = section_end;
 
-        let mut cursor = Cursor::new(section);
-        let cid =
-            Cid::read_bytes(&mut cursor).map_err(|e| format!("invalid CAR section CID: {e}"))?;
-        let cid_len = usize::try_from(cursor.position())
-            .map_err(|_| "CAR CID offset overflow".to_string())?;
-        if cid.to_bytes().as_slice() != &section[..cid_len] {
-            return Err("non-canonical CID encoding in CAR section".to_string());
-        }
+        let (cid, cid_len) =
+            read_car_section_cid(section).map_err(|e| format!("invalid CAR section CID: {e}"))?;
         let data_len = section
             .len()
             .checked_sub(cid_len)
@@ -1920,18 +1932,17 @@ fn parse_bounded_car_v1(car_bytes: &[u8]) -> Result<ParsedCarV1<'_>, String> {
 
         if !is_valid_dag_cbor_sha256_cid_v1(&cid) {
             return Err(format!(
-                "unsupported CAR block CID (version={:?}, codec=0x{:x}, hash=0x{:x})",
-                cid.version(),
+                "unsupported CAR block CID (codec=0x{:x}, hash=0x{:x})",
                 cid.codec(),
-                cid.hash().code()
+                cid.hash_code()
             ));
         }
         let actual_digest: [u8; SHA2_256_DIGEST_LEN] = Sha256::digest(block).into();
-        if actual_digest.as_slice() != cid.hash().digest() {
+        if actual_digest.as_slice() != cid.digest() {
             return Err(format!("CAR block SHA-256 digest mismatch for CID {cid}"));
         }
 
-        if blocks.insert(cid, block).is_some() {
+        if blocks.insert(cid.clone(), block).is_some() {
             return Err(format!("duplicate CID {cid} in CAR archive"));
         }
     }
@@ -1946,14 +1957,8 @@ fn parse_bounded_car_v1_blocks(car_bytes: &[u8]) -> Result<HashMap<Cid, &[u8]>, 
 
 /// Relay sequence number of any firehose message that carries one (`#info` and unknown
 /// message types do not).
-fn message_seq(msg: &SubscribeReposMessage) -> Option<i64> {
-    match msg {
-        SubscribeReposMessage::Commit(m) => Some(m.seq),
-        SubscribeReposMessage::Sync(m) => Some(m.seq),
-        SubscribeReposMessage::Identity(m) => Some(m.seq),
-        SubscribeReposMessage::Account(m) => Some(m.seq),
-        _ => None,
-    }
+fn message_seq(msg: &RelayEvent) -> Option<i64> {
+    msg.sequence()
 }
 
 impl Consumer for WitnessConsumer {
@@ -1982,7 +1987,7 @@ impl Consumer for WitnessConsumer {
         metrics::WITNESS_CONSUMER_EVENT_ERRORS.inc();
     }
 
-    async fn handle_event(&self, event: Arc<SubscribeReposMessage>) -> Result<()> {
+    async fn handle_event(&self, event: Arc<RelayEvent>) -> Result<()> {
         let seq = message_seq(event.as_ref());
         // A gap stays open until a message that carries a seq arrives, so its upper bound is
         // recorded whenever the relay provides one.
@@ -1992,14 +1997,11 @@ impl Consumer for WitnessConsumer {
         }
         self.flush_pending_unverified().await;
 
-        let SubscribeReposMessage::Commit(commit) = event.as_ref() else {
+        let RelayEvent::Commit(commit) = event.as_ref() else {
             return Ok(());
         };
 
-        let has_transparency_ops = commit
-            .ops
-            .iter()
-            .any(|op| is_transparency_path(op.path.as_ref()));
+        let has_transparency_ops = commit.ops.iter().any(|op| is_transparency_path(&op.path));
         if !has_transparency_ops {
             return Ok(());
         }
@@ -2041,12 +2043,11 @@ impl Consumer for WitnessConsumer {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use catbird_atproto::generated::blue_catbird::labyrinth::{
-        mailbox_keys::MailboxKeysBackend, EpochPublic, TransportAttestation,
+    use petrel_catbird::generated::blue::catbird::labyrinth::defs::{
+        EpochPublic, TransportAttestation,
     };
-    use catbird_atproto::jacquard_common::{
-        deps::bytes::Bytes as JqBytes, types::string::Datetime,
-    };
+    use petrel_core::{Bytes, Datetime};
+    use petrel_firehose::{RelayIdentityEvent, RelayRepoOp};
     use std::collections::BTreeMap;
 
     fn encode_device_cbor(alg: &str, seed_byte: u8, _key_len: usize) -> Vec<u8> {
@@ -2071,10 +2072,10 @@ mod tests {
         let dev: Device = Device {
             algorithm: alg.into(),
             created_at: dt,
-            mls_signature_public_key: JqBytes::from(pubkey_bytes),
+            mls_signature_public_key: Bytes(pubkey_bytes),
             extra_data: None,
         };
-        serde_ipld_dagcbor::to_vec(&dev).expect("encode Device DAG-CBOR")
+        petrel_core::to_dag_cbor(&dev).expect("encode Device DAG-CBOR")
     }
 
     fn test_epoch_signing_secret(actor_did: &str, epoch_number: i64) -> [u8; 32] {
@@ -2102,9 +2103,7 @@ mod tests {
         let prev_sig = prev_head_byte.map(|_| {
             let prev_secret = test_epoch_signing_secret(actor_did, epoch_number.saturating_sub(1));
             let prev_msg = [verify::LABYRINTH_PREV_SIG_PREFIX, epoch_head.as_slice()].concat();
-            JqBytes::from(
-                verify::xeddsa_sign_deterministic(&prev_secret, &prev_msg, &[0x43; 64]).to_vec(),
-            )
+            Bytes(verify::xeddsa_sign_deterministic(&prev_secret, &prev_msg, &[0x43; 64]).to_vec())
         });
 
         let transport_seed: [u8; 32] =
@@ -2116,30 +2115,28 @@ mod tests {
         let attest_sig = transport_sk.sign(&attest_msg);
 
         let mk: MailboxKeys = MailboxKeys {
-            backend: Some(MailboxKeysBackend::Space),
+            backend: Some("space".to_string()),
             current: EpochPublic {
                 attestation: TransportAttestation {
-                    sig: JqBytes::from(attest_sig.to_bytes().to_vec()),
-                    transport_pubkey: JqBytes::from(
-                        transport_sk.verifying_key().to_bytes().to_vec(),
-                    ),
+                    sig: Bytes(attest_sig.to_bytes().to_vec()),
+                    transport_pubkey: Bytes(transport_sk.verifying_key().to_bytes().to_vec()),
                     extra_data: None,
                 },
-                auth_pubkey: JqBytes::from(vec![0x11; 32]),
-                encryption_pubkey: JqBytes::from(vec![0x22; 1216]),
-                epoch_head: JqBytes::from(epoch_head.to_vec()),
+                auth_pubkey: Bytes(vec![0x11; 32]),
+                encryption_pubkey: Bytes(vec![0x22; 1216]),
+                epoch_head: Bytes(epoch_head.to_vec()),
                 epoch_number,
-                members_hash: JqBytes::from(vec![0x33; 32]),
+                members_hash: Bytes(vec![0x33; 32]),
                 prev_sig,
-                previous_epoch_head: prev_head_byte.map(|b| JqBytes::from(vec![b; 32])),
-                self_sig: JqBytes::from(self_sig.to_vec()),
-                signing_pubkey: JqBytes::from(signing_pubkey.to_vec()),
+                previous_epoch_head: prev_head_byte.map(|b| Bytes(vec![b; 32])),
+                self_sig: Bytes(self_sig.to_vec()),
+                signing_pubkey: Bytes(signing_pubkey.to_vec()),
                 extra_data: None,
             },
             updated_at: dt,
             extra_data: None,
         };
-        serde_ipld_dagcbor::to_vec(&mk).expect("encode MailboxKeys DAG-CBOR")
+        petrel_core::to_dag_cbor(&mk).expect("encode MailboxKeys DAG-CBOR")
     }
 
     fn build_subscribe_repos_commit_msg(
@@ -2149,41 +2146,27 @@ mod tests {
         commit_cid: Cid,
         car_bytes: Vec<u8>,
         ops: Vec<(&str, &str, Option<Cid>)>,
-    ) -> Arc<SubscribeReposMessage> {
-        use jacquard_common::IntoStatic as _;
-
-        let mut op_list = Vec::with_capacity(ops.len());
-        for (action, path, cid_opt) in ops {
-            let mut op_map = BTreeMap::new();
-            op_map.insert("action".to_string(), Ipld::String(action.to_string()));
-            op_map.insert("path".to_string(), Ipld::String(path.to_string()));
-            if let Some(cid) = cid_opt {
-                op_map.insert("cid".to_string(), Ipld::Link(cid));
-            }
-            op_list.push(Ipld::Map(op_map));
-        }
-
-        let mut commit_map = BTreeMap::new();
-        commit_map.insert("blobs".to_string(), Ipld::List(vec![]));
-        commit_map.insert("blocks".to_string(), Ipld::Bytes(car_bytes));
-        commit_map.insert("commit".to_string(), Ipld::Link(commit_cid));
-        commit_map.insert("ops".to_string(), Ipld::List(op_list));
-        commit_map.insert("rebase".to_string(), Ipld::Bool(false));
-        commit_map.insert("repo".to_string(), Ipld::String(did.to_string()));
-        commit_map.insert("rev".to_string(), Ipld::String(rev.to_string()));
-        commit_map.insert("seq".to_string(), Ipld::Integer(seq as i128));
-        commit_map.insert(
-            "time".to_string(),
-            Ipld::String("2026-11-13T12:05:00Z".to_string()),
-        );
-        commit_map.insert("tooBig".to_string(), Ipld::Bool(false));
-
-        let raw_commit = serde_ipld_dagcbor::to_vec(&Ipld::Map(commit_map)).unwrap();
-        let decoded_commit: jacquard_api::com_atproto::sync::subscribe_repos::Commit =
-            serde_ipld_dagcbor::from_slice(&raw_commit).unwrap();
-        Arc::new(SubscribeReposMessage::Commit(Box::new(
-            decoded_commit.into_static(),
-        )))
+    ) -> Arc<RelayEvent> {
+        let ops = ops
+            .into_iter()
+            .map(|(action, path, cid)| RelayRepoOp {
+                action: RelayRepoAction::from_wire(action).expect("known repo op action"),
+                path: path.to_string(),
+                cid,
+                prev: None,
+            })
+            .collect();
+        Arc::new(RelayEvent::Commit(RelayCommitEvent {
+            seq,
+            repo: did.to_string(),
+            commit_cid,
+            rev: rev.to_string(),
+            since: None,
+            blocks: car_bytes,
+            ops,
+            prev_data_cid: None,
+            time: "2026-11-13T12:05:00Z".to_string(),
+        }))
     }
 
     fn sub_be_32(minuend: &[u8; 32], subtrahend: &[u8; 32]) -> [u8; 32] {
@@ -2571,21 +2554,26 @@ mod tests {
             let dev2_bytes = encode_device_cbor("p256", 0x03, 33);
             let dev2_cid = verify::compute_dagcbor_cid(&dev2_bytes);
             let mut mst_records = BTreeMap::new();
-            mst_records.insert(dev2_path.to_string(), dev2_cid);
+            mst_records.insert(dev2_path.to_string(), dev2_cid.clone());
             let mst_bytes = verify::encode_mst_leaf_cbor(&mst_records);
             let mst_cid = verify::compute_dagcbor_cid(&mst_bytes);
             let unsigned_commit =
-                verify::encode_unsigned_v3_commit_cbor(did, "3l7dddd222224", mst_cid, None);
+                verify::encode_unsigned_v3_commit_cbor(did, "3l7dddd222224", mst_cid.clone(), None);
             let sig_p256 = verify::sign_p256_low_s(&dave_p256_sk, &unsigned_commit);
-            let signed_commit =
-                verify::encode_signed_v3_commit_cbor(did, "3l7dddd222224", mst_cid, None, sig_p256);
+            let signed_commit = verify::encode_signed_v3_commit_cbor(
+                did,
+                "3l7dddd222224",
+                mst_cid.clone(),
+                None,
+                sig_p256,
+            );
             let root_cid = verify::compute_dagcbor_cid(&signed_commit);
             let car_bytes = verify::encode_car_v1(
-                &[root_cid],
+                std::slice::from_ref(&root_cid),
                 &[
-                    (root_cid, signed_commit),
-                    (mst_cid, mst_bytes),
-                    (dev2_cid, dev2_bytes),
+                    (root_cid.clone(), signed_commit),
+                    (mst_cid.clone(), mst_bytes),
+                    (dev2_cid.clone(), dev2_bytes),
                 ],
             );
 
@@ -2593,9 +2581,9 @@ mod tests {
                 did,
                 "3l7dddd222224",
                 3,
-                root_cid,
+                root_cid.clone(),
                 car_bytes,
-                vec![("create", dev2_path, Some(dev2_cid))],
+                vec![("create", dev2_path, Some(dev2_cid.clone()))],
             );
             consumer.handle_event(msg).await.unwrap();
 
@@ -2613,39 +2601,39 @@ mod tests {
             let eva_dev_bytes = encode_device_cbor("ed25519", 0x29, 32);
             let eva_dev_cid = verify::compute_dagcbor_cid(&eva_dev_bytes);
             let mut eva_mst_map = BTreeMap::new();
-            eva_mst_map.insert(eva_dev_path.to_string(), eva_dev_cid);
+            eva_mst_map.insert(eva_dev_path.to_string(), eva_dev_cid.clone());
             let eva_mst_bytes = verify::encode_mst_leaf_cbor(&eva_mst_map);
             let eva_mst_cid = verify::compute_dagcbor_cid(&eva_mst_bytes);
             let eva_unsigned = verify::encode_unsigned_v3_commit_cbor(
                 k256_did,
                 "3l7eeee222222",
-                eva_mst_cid,
-                Some(root_cid),
+                eva_mst_cid.clone(),
+                Some(root_cid.clone()),
             );
             let sig_k256 = verify::sign_k256_low_s(&eva_k256_sk, &eva_unsigned);
             let eva_signed = verify::encode_signed_v3_commit_cbor(
                 k256_did,
                 "3l7eeee222222",
-                eva_mst_cid,
-                Some(root_cid),
+                eva_mst_cid.clone(),
+                Some(root_cid.clone()),
                 sig_k256,
             );
             let eva_root_cid = verify::compute_dagcbor_cid(&eva_signed);
             let eva_car = verify::encode_car_v1(
-                &[eva_root_cid],
+                std::slice::from_ref(&eva_root_cid),
                 &[
-                    (eva_root_cid, eva_signed),
-                    (eva_mst_cid, eva_mst_bytes),
-                    (eva_dev_cid, eva_dev_bytes),
+                    (eva_root_cid.clone(), eva_signed),
+                    (eva_mst_cid.clone(), eva_mst_bytes),
+                    (eva_dev_cid.clone(), eva_dev_bytes),
                 ],
             );
             let eva_msg = build_subscribe_repos_commit_msg(
                 k256_did,
                 "3l7eeee222222",
                 4,
-                eva_root_cid,
+                eva_root_cid.clone(),
                 eva_car,
-                vec![("create", eva_dev_path, Some(eva_dev_cid))],
+                vec![("create", eva_dev_path, Some(eva_dev_cid.clone()))],
             );
             consumer.handle_event(eva_msg).await.unwrap();
             let mut tx = pool.begin().await.unwrap();
@@ -2660,16 +2648,19 @@ mod tests {
             //    verification_failures + WITNESS_VERIFICATION_FAILURES, and NOT advance actor_head!
             let valid_hdr_bytes = {
                 let mut h = BTreeMap::new();
-                h.insert("version".to_string(), Ipld::Integer(1));
-                h.insert("roots".to_string(), Ipld::List(vec![Ipld::Link(root_cid)]));
-                serde_ipld_dagcbor::to_vec(&Ipld::Map(h)).unwrap()
+                h.insert("version".to_string(), Value::Integer(1));
+                h.insert(
+                    "roots".to_string(),
+                    Value::Array(vec![Value::Link(root_cid.clone())]),
+                );
+                petrel_core::to_dag_cbor(&Value::Object(h)).unwrap()
             };
 
             let mut underflow_car = Vec::new();
             underflow_car.push(valid_hdr_bytes.len() as u8);
             underflow_car.extend_from_slice(&valid_hdr_bytes);
             underflow_car.push(1u8);
-            underflow_car.extend_from_slice(&dev2_cid.to_bytes());
+            underflow_car.extend_from_slice(dev2_cid.as_bytes());
 
             let oversized_hdr_car = vec![0xFF, 0xFF, 0xFF, 0xFF, 0x0F, 0xA1, 0x61, 0x76, 0x01];
 
@@ -2703,9 +2694,9 @@ mod tests {
                     did,
                     rev_str,
                     seq_num,
-                    root_cid,
+                    root_cid.clone(),
                     bad_blocks,
-                    vec![("create", &op_path, Some(dev2_cid))],
+                    vec![("create", &op_path, Some(dev2_cid.clone()))],
                 );
                 let err = consumer
                     .handle_event(adv_msg)
@@ -2839,16 +2830,17 @@ mod tests {
     #[test]
     fn bounded_car_reader_rejects_underflow_oversized_header_and_digest_mismatch() {
         let block = b"\xa1dtest\xf5";
-        let digest = Sha256::digest(block);
-        let mh = ipld_core::cid::multihash::Multihash::wrap(SHA2_256_CODE, &digest).unwrap();
-        let valid_cid = Cid::new_v1(DAG_CBOR_CODEC, mh);
-        let cid_bytes = valid_cid.to_bytes();
+        let valid_cid = Cid::for_dag_cbor(block);
+        let cid_bytes = valid_cid.as_bytes().to_vec();
 
         let hdr_bytes = {
             let mut h = std::collections::BTreeMap::new();
-            h.insert("version".to_string(), Ipld::Integer(1));
-            h.insert("roots".to_string(), Ipld::List(vec![Ipld::Link(valid_cid)]));
-            serde_ipld_dagcbor::to_vec(&Ipld::Map(h)).unwrap()
+            h.insert("version".to_string(), Value::Integer(1));
+            h.insert(
+                "roots".to_string(),
+                Value::Array(vec![Value::Link(valid_cid.clone())]),
+            );
+            petrel_core::to_dag_cbor(&Value::Object(h)).unwrap()
         };
 
         // Positive control
@@ -2933,13 +2925,17 @@ mod tests {
         .unwrap();
         assert_eq!(resolved_p256, p256_vk);
 
-        let unsigned_p256 =
-            verify::encode_unsigned_v3_commit_cbor(did_p256, "3l7p256000001", mst_cid, None);
+        let unsigned_p256 = verify::encode_unsigned_v3_commit_cbor(
+            did_p256,
+            "3l7p256000001",
+            mst_cid.clone(),
+            None,
+        );
         let sig_p256 = verify::sign_p256_low_s(&p256_sk, &unsigned_p256);
         let signed_p256 = verify::encode_signed_v3_commit_cbor(
             did_p256,
             "3l7p256000001",
-            mst_cid,
+            mst_cid.clone(),
             None,
             sig_p256,
         );
@@ -2950,7 +2946,7 @@ mod tests {
             &resolved_p256,
         )
         .expect("valid P-256 commit signature must verify");
-        assert_eq!(out_p256, mst_cid);
+        assert_eq!(out_p256, mst_cid.clone());
 
         // 2) secp256k1 (`0xe7` / `[0xe7, 0x01]` / `zQ3s...`) Multikey + JWK + signed commit (with prev link)
         let k256_sk = k256::ecdsa::SigningKey::from_bytes((&[0x31u8; 32]).into()).unwrap();
@@ -2990,15 +2986,15 @@ mod tests {
         let unsigned_k256 = verify::encode_unsigned_v3_commit_cbor(
             did_k256,
             "3l7k256000002",
-            mst_cid,
-            Some(prev_cid),
+            mst_cid.clone(),
+            Some(prev_cid.clone()),
         );
         let sig_k256 = verify::sign_k256_low_s(&k256_sk, &unsigned_k256);
         let signed_k256 = verify::encode_signed_v3_commit_cbor(
             did_k256,
             "3l7k256000002",
-            mst_cid,
-            Some(prev_cid),
+            mst_cid.clone(),
+            Some(prev_cid.clone()),
             sig_k256,
         );
         let out_k256 = verify_atproto_v3_commit_signature(
@@ -3008,7 +3004,7 @@ mod tests {
             &resolved_k256,
         )
         .expect("valid secp256k1 commit signature must verify");
-        assert_eq!(out_k256, mst_cid);
+        assert_eq!(out_k256, mst_cid.clone());
     }
 
     #[test]
@@ -3024,21 +3020,21 @@ mod tests {
         let dev_cid = verify::compute_dagcbor_cid(&dev_bytes);
 
         let mut mst_map = BTreeMap::new();
-        mst_map.insert(dev_path.to_string(), dev_cid);
+        mst_map.insert(dev_path.to_string(), dev_cid.clone());
         let mst_bytes = verify::encode_mst_leaf_cbor(&mst_map);
         let mst_cid = verify::compute_dagcbor_cid(&mst_bytes);
 
-        let unsigned = verify::encode_unsigned_v3_commit_cbor(did, rev, mst_cid, None);
+        let unsigned = verify::encode_unsigned_v3_commit_cbor(did, rev, mst_cid.clone(), None);
         let sig = verify::sign_p256_low_s(&p256_sk, &unsigned);
         let valid_commit =
-            verify::encode_signed_v3_commit_cbor(did, rev, mst_cid, None, sig.clone());
+            verify::encode_signed_v3_commit_cbor(did, rev, mst_cid.clone(), None, sig.clone());
         let right_vk = AtprotoVerifyingKey::P256(*p256_sk.verifying_key());
 
         // 1) Tampered MST data root inside commit CBOR while reusing original signature
         let evil_mst_cid =
             verify::compute_dagcbor_cid(&verify::encode_mst_leaf_cbor(&BTreeMap::new()));
         let tampered_data_commit =
-            verify::encode_signed_v3_commit_cbor(did, rev, evil_mst_cid, None, sig.clone());
+            verify::encode_signed_v3_commit_cbor(did, rev, evil_mst_cid.clone(), None, sig.clone());
         assert_eq!(
             verify_atproto_v3_commit_signature(&tampered_data_commit, did, rev, &right_vk),
             Err(CommitVerifyError::InvalidSignature)
@@ -3046,7 +3042,7 @@ mod tests {
 
         // 2) Tampered rev in commit CBOR (matching frame rev, breaking signature over unsigned commit)
         let tampered_rev_commit =
-            verify::encode_signed_v3_commit_cbor(did, "3l7tamper9999", mst_cid, None, sig);
+            verify::encode_signed_v3_commit_cbor(did, "3l7tamper9999", mst_cid.clone(), None, sig);
         assert_eq!(
             verify_atproto_v3_commit_signature(
                 &tampered_rev_commit,
@@ -3086,15 +3082,15 @@ mod tests {
 
         // 5) MST inclusion/exclusion checks reject spoofed paths and wrong CIDs
         let mut blocks = HashMap::new();
-        blocks.insert(mst_cid, mst_bytes.as_slice());
+        blocks.insert(mst_cid.clone(), mst_bytes.as_slice());
         assert_eq!(
-            verify_mst_key_lookup(&blocks, mst_cid, dev_path.as_bytes()).unwrap(),
-            Some(dev_cid)
+            verify_mst_key_lookup(&blocks, mst_cid.clone(), dev_path.as_bytes()).unwrap(),
+            Some(dev_cid.clone())
         );
         assert_eq!(
             verify_mst_key_lookup(
                 &blocks,
-                mst_cid,
+                mst_cid.clone(),
                 b"blue.catbird.chat.device/3l7spoofedabsent"
             )
             .unwrap(),
@@ -3118,7 +3114,7 @@ mod tests {
         let did = "did:plc:malleabilitytest00000001";
         let rev = "3l7malleable1";
         let mst_cid = verify::compute_dagcbor_cid(&verify::encode_mst_leaf_cbor(&BTreeMap::new()));
-        let unsigned = verify::encode_unsigned_v3_commit_cbor(did, rev, mst_cid, None);
+        let unsigned = verify::encode_unsigned_v3_commit_cbor(did, rev, mst_cid.clone(), None);
 
         let p256_sk = p256::ecdsa::SigningKey::from_bytes((&[0x61u8; 32]).into()).unwrap();
         let p256_vk = AtprotoVerifyingKey::P256(*p256_sk.verifying_key());
@@ -3138,7 +3134,7 @@ mod tests {
             vec![0x00; 64],
         ] {
             let commit_bytes =
-                verify::encode_signed_v3_commit_cbor(did, rev, mst_cid, None, bad_sig);
+                verify::encode_signed_v3_commit_cbor(did, rev, mst_cid.clone(), None, bad_sig);
             assert!(
                 matches!(
                     verify_atproto_v3_commit_signature(&commit_bytes, did, rev, &p256_vk),
@@ -3161,8 +3157,13 @@ mod tests {
                 .to_bytes()[..],
             p256_low.as_slice()
         );
-        let p256_high_commit =
-            verify::encode_signed_v3_commit_cbor(did, rev, mst_cid, None, p256_high.to_vec());
+        let p256_high_commit = verify::encode_signed_v3_commit_cbor(
+            did,
+            rev,
+            mst_cid.clone(),
+            None,
+            p256_high.to_vec(),
+        );
         assert_eq!(
             verify_atproto_v3_commit_signature(&p256_high_commit, did, rev, &p256_vk),
             Err(CommitVerifyError::HighSSignature)
@@ -3184,8 +3185,13 @@ mod tests {
                 .to_bytes()[..],
             k256_low.as_slice()
         );
-        let k256_high_commit =
-            verify::encode_signed_v3_commit_cbor(did, rev, mst_cid, None, k256_high.to_vec());
+        let k256_high_commit = verify::encode_signed_v3_commit_cbor(
+            did,
+            rev,
+            mst_cid.clone(),
+            None,
+            k256_high.to_vec(),
+        );
         assert_eq!(
             verify_atproto_v3_commit_signature(&k256_high_commit, did, rev, &k256_vk),
             Err(CommitVerifyError::HighSSignature)
@@ -3219,22 +3225,22 @@ mod tests {
 
         // 1) Forged 64-byte `selfSig` (canonical scalar = 1, wrong signature) must be rejected.
         let mut forged_self: MailboxKeys =
-            serde_ipld_dagcbor::from_slice(&encode_mailbox_cbor(alice, 1, 0x11, Some(0x10)))
+            petrel_core::from_dag_cbor_strict(&encode_mailbox_cbor(alice, 1, 0x11, Some(0x10)))
                 .unwrap();
         let mut fake_sig = [0u8; 64];
         fake_sig[32] = 1;
-        forged_self.current.self_sig = JqBytes::from(fake_sig.to_vec());
-        let forged_self_bytes = serde_ipld_dagcbor::to_vec(&forged_self).unwrap();
+        forged_self.current.self_sig = Bytes(fake_sig.to_vec());
+        let forged_self_bytes = petrel_core::to_dag_cbor(&forged_self).unwrap();
 
         // 2) Forged `prevSig` signed by a rogue X25519 key while `previousEpochHead` matches epoch 0!
         let mut forged_prev: MailboxKeys =
-            serde_ipld_dagcbor::from_slice(&encode_mailbox_cbor(alice, 1, 0x11, Some(0x10)))
+            petrel_core::from_dag_cbor_strict(&encode_mailbox_cbor(alice, 1, 0x11, Some(0x10)))
                 .unwrap();
         let rogue_prev_msg = [verify::LABYRINTH_PREV_SIG_PREFIX, &[0x11u8; 32]].concat();
         let rogue_prev_sig =
             verify::xeddsa_sign_deterministic(&[0x99u8; 32], &rogue_prev_msg, &[0x55; 64]);
-        forged_prev.current.prev_sig = Some(JqBytes::from(rogue_prev_sig.to_vec()));
-        let forged_prev_bytes = serde_ipld_dagcbor::to_vec(&forged_prev).unwrap();
+        forged_prev.current.prev_sig = Some(Bytes(rogue_prev_sig.to_vec()));
+        let forged_prev_bytes = petrel_core::to_dag_cbor(&forged_prev).unwrap();
 
         // 3) Forged `attestation.sig` signed for a different DID.
         let wrong_did_attest_bytes =
@@ -3245,10 +3251,10 @@ mod tests {
         let bad_dev: Device = Device {
             algorithm: "p256".into(),
             created_at: dt,
-            mls_signature_public_key: JqBytes::from(vec![0x00; 33]),
+            mls_signature_public_key: Bytes(vec![0x00; 33]),
             extra_data: None,
         };
-        let bad_dev_bytes = serde_ipld_dagcbor::to_vec(&bad_dev).unwrap();
+        let bad_dev_bytes = petrel_core::to_dag_cbor(&bad_dev).unwrap();
 
         let self_fail_before = metrics::WITNESS_VERIFICATION_FAILURES
             .with_label_values(&["invalid_mailbox_self_sig"])
@@ -3426,27 +3432,27 @@ mod tests {
         sk: &k256::ecdsa::SigningKey,
         dev_path: &str,
         dev_seed: u8,
-    ) -> Arc<SubscribeReposMessage> {
+    ) -> Arc<RelayEvent> {
         let dev_bytes = encode_device_cbor("ed25519", dev_seed, 32);
         let dev_cid = verify::compute_dagcbor_cid(&dev_bytes);
         let mut mst_map = BTreeMap::new();
-        mst_map.insert(dev_path.to_string(), dev_cid);
+        mst_map.insert(dev_path.to_string(), dev_cid.clone());
         let (mst_cid, mst_blocks) = verify::encode_canonical_mst(&mst_map);
-        let unsigned = verify::encode_unsigned_v3_commit_cbor(did, rev, mst_cid, None);
+        let unsigned = verify::encode_unsigned_v3_commit_cbor(did, rev, mst_cid.clone(), None);
         let sig = verify::sign_k256_low_s(sk, &unsigned);
-        let signed = verify::encode_signed_v3_commit_cbor(did, rev, mst_cid, None, sig);
+        let signed = verify::encode_signed_v3_commit_cbor(did, rev, mst_cid.clone(), None, sig);
         let root_cid = verify::compute_dagcbor_cid(&signed);
-        let mut sections = vec![(root_cid, signed)];
+        let mut sections = vec![(root_cid.clone(), signed)];
         sections.extend(mst_blocks);
-        sections.push((dev_cid, dev_bytes));
-        let car = verify::encode_car_v1(&[root_cid], &sections);
+        sections.push((dev_cid.clone(), dev_bytes));
+        let car = verify::encode_car_v1(std::slice::from_ref(&root_cid), &sections);
         build_subscribe_repos_commit_msg(
             did,
             rev,
             seq,
-            root_cid,
+            root_cid.clone(),
             car,
-            vec![("create", dev_path, Some(dev_cid))],
+            vec![("create", dev_path, Some(dev_cid.clone()))],
         )
     }
 
@@ -3868,22 +3874,13 @@ mod tests {
             .await;
     }
 
-    fn identity_msg(did: &str, seq: i64) -> Arc<SubscribeReposMessage> {
-        use jacquard_common::IntoStatic as _;
-
-        let mut map = BTreeMap::new();
-        map.insert("did".to_string(), Ipld::String(did.to_string()));
-        map.insert("seq".to_string(), Ipld::Integer(seq as i128));
-        map.insert(
-            "time".to_string(),
-            Ipld::String("2026-11-16T12:00:00Z".to_string()),
-        );
-        let raw = serde_ipld_dagcbor::to_vec(&Ipld::Map(map)).unwrap();
-        let identity: jacquard_api::com_atproto::sync::subscribe_repos::Identity =
-            serde_ipld_dagcbor::from_slice(&raw).unwrap();
-        Arc::new(SubscribeReposMessage::Identity(Box::new(
-            identity.into_static(),
-        )))
+    fn identity_msg(did: &str, seq: i64) -> Arc<RelayEvent> {
+        Arc::new(RelayEvent::Identity(RelayIdentityEvent {
+            seq,
+            did: did.to_string(),
+            time: "2026-11-16T12:00:00Z".to_string(),
+            handle: None,
+        }))
     }
 
     #[tokio::test]
@@ -3959,7 +3956,7 @@ mod tests {
 
     fn record_cid_for(key: &str) -> Cid {
         verify::compute_dagcbor_cid(
-            &serde_ipld_dagcbor::to_vec(&Ipld::String(key.to_string())).unwrap(),
+            &petrel_core::to_dag_cbor(&Value::String(key.to_string())).unwrap(),
         )
     }
 
@@ -4017,31 +4014,31 @@ mod tests {
         assert!(nodes.len() >= 4, "fixture must be a multi-level tree");
         let blocks: HashMap<Cid, &[u8]> = nodes
             .iter()
-            .map(|(cid, bytes)| (*cid, bytes.as_slice()))
+            .map(|(cid, bytes)| (cid.clone(), bytes.as_slice()))
             .collect();
-        let root: Ipld = serde_ipld_dagcbor::from_slice(blocks[&root_cid]).unwrap();
-        let Ipld::Map(root_map) = &root else {
+        let root: Value = petrel_core::from_dag_cbor(blocks[&root_cid]).unwrap();
+        let Value::Object(root_map) = &root else {
             panic!("root node is a map")
         };
         assert!(
-            matches!(root_map.get("l"), Some(Ipld::Link(_))),
+            matches!(root_map.get("l"), Some(Value::Link(_))),
             "root must have a left subtree"
         );
-        let Some(Ipld::List(root_entries)) = root_map.get("e") else {
+        let Some(Value::Array(root_entries)) = root_map.get("e") else {
             panic!("root has entries")
         };
         assert_eq!(root_entries.len(), 4, "the layer-2 keys sit at the root");
         assert!(
-            root_entries
-                .iter()
-                .all(|e| matches!(e, Ipld::Map(m) if matches!(m.get("t"), Some(Ipld::Link(_))))),
+            root_entries.iter().all(
+                |e| matches!(e, Value::Object(m) if matches!(m.get("t"), Some(Value::Link(_))))
+            ),
             "every root entry must have a right subtree"
         );
 
         for (key, cid) in &present {
             assert_eq!(
-                verify::verify_mst_key_lookup(&blocks, root_cid, key.as_bytes()),
-                Ok(Some(*cid)),
+                verify::verify_mst_key_lookup(&blocks, root_cid.clone(), key.as_bytes()),
+                Ok(Some(cid.clone())),
                 "inclusion of {key}"
             );
         }
@@ -4053,7 +4050,7 @@ mod tests {
             .chain([before_all, after_all])
         {
             assert_eq!(
-                verify::verify_mst_key_lookup(&blocks, root_cid, key.as_bytes()),
+                verify::verify_mst_key_lookup(&blocks, root_cid.clone(), key.as_bytes()),
                 Ok(None),
                 "exclusion of {key}"
             );
@@ -4079,16 +4076,16 @@ mod tests {
         let dev_bytes = encode_device_cbor("ed25519", 0x5A, 32);
         let dev_cid = verify::compute_dagcbor_cid(&dev_bytes);
         let mut records = present.clone();
-        records.insert(dev_path.clone(), dev_cid);
+        records.insert(dev_path.clone(), dev_cid.clone());
         let (mst_cid, mst_nodes) = verify::encode_canonical_mst(&records);
-        let unsigned = verify::encode_unsigned_v3_commit_cbor(did, rev, mst_cid, None);
+        let unsigned = verify::encode_unsigned_v3_commit_cbor(did, rev, mst_cid.clone(), None);
         let sig = verify::sign_k256_low_s(&sk, &unsigned);
-        let signed = verify::encode_signed_v3_commit_cbor(did, rev, mst_cid, None, sig);
+        let signed = verify::encode_signed_v3_commit_cbor(did, rev, mst_cid.clone(), None, sig);
         let commit_cid = verify::compute_dagcbor_cid(&signed);
-        let mut sections = vec![(commit_cid, signed)];
+        let mut sections = vec![(commit_cid.clone(), signed)];
         sections.extend(mst_nodes);
-        sections.push((dev_cid, dev_bytes));
-        let car = verify::encode_car_v1(&[commit_cid], &sections);
+        sections.push((dev_cid.clone(), dev_bytes));
+        let car = verify::encode_car_v1(std::slice::from_ref(&commit_cid), &sections);
         let deleted_path = absent
             .iter()
             .find(|k| verify::mst_key_layer(k.as_bytes()) == 0)
@@ -4097,14 +4094,14 @@ mod tests {
             did,
             rev,
             40,
-            commit_cid,
+            commit_cid.clone(),
             car,
             vec![
-                ("create", dev_path.as_str(), Some(dev_cid)),
+                ("create", dev_path.as_str(), Some(dev_cid.clone())),
                 ("delete", deleted_path.as_str(), None),
             ],
         );
-        let SubscribeReposMessage::Commit(frame) = msg.as_ref() else {
+        let RelayEvent::Commit(frame) = msg.as_ref() else {
             panic!("commit frame")
         };
         let observed = consumer
@@ -4129,17 +4126,17 @@ mod tests {
         let lookup = |nodes: &[(Cid, Vec<u8>)], root: Cid, key: &str| {
             let blocks: HashMap<Cid, &[u8]> = nodes
                 .iter()
-                .map(|(cid, bytes)| (*cid, bytes.as_slice()))
+                .map(|(cid, bytes)| (cid.clone(), bytes.as_slice()))
                 .collect();
-            verify::verify_mst_key_lookup(&blocks, root, key.as_bytes())
+            verify::verify_mst_key_lookup(&blocks, root.clone(), key.as_bytes())
         };
         let node = |left: Option<Cid>, entries: &[(&str, Option<Cid>)]| {
             let mut sorted: Vec<(&[u8], Cid, Option<Cid>)> = entries
                 .iter()
-                .map(|(k, t)| (k.as_bytes(), record_cid_for(k), *t))
+                .map(|(k, t)| (k.as_bytes(), record_cid_for(k), t.clone()))
                 .collect();
             sorted.sort_by(|a, b| a.0.cmp(b.0));
-            let bytes = verify::encode_mst_node_cbor(left, &sorted);
+            let bytes = verify::encode_mst_node_cbor(left.clone(), &sorted);
             (verify::compute_dagcbor_cid(&bytes), bytes)
         };
 
@@ -4151,7 +4148,7 @@ mod tests {
         };
         let mixed = node(None, &[(lo, None), (hi, None)]);
         for key in [lo, hi] {
-            let err = lookup(std::slice::from_ref(&mixed), mixed.0, key)
+            let err = lookup(std::slice::from_ref(&mixed), mixed.0.clone(), key)
                 .expect_err("node mixing key layers must be rejected");
             assert!(err.contains("layer"), "{err}");
         }
@@ -4161,7 +4158,7 @@ mod tests {
         ones.sort();
         let (child_key, root_key) = (&ones[0], &ones[1]);
         let child = node(None, &[(child_key, None)]);
-        let root = node(Some(child.0), &[(root_key, None)]);
+        let root = node(Some(child.0.clone()), &[(root_key, None)]);
         let err = lookup(&[child.clone(), root.clone()], root.0, child_key)
             .expect_err("subtree on the parent's layer must be rejected");
         assert!(err.contains("layer"), "{err}");
@@ -4170,7 +4167,7 @@ mod tests {
         let mut zeros = l0.clone();
         zeros.sort();
         let leaf = node(None, &[(&zeros[1], None)]);
-        let bad_leaf_parent = node(None, &[(&zeros[0], Some(leaf.0))]);
+        let bad_leaf_parent = node(None, &[(&zeros[0], Some(leaf.0.clone()))]);
         let err = lookup(
             &[leaf, bad_leaf_parent.clone()],
             bad_leaf_parent.0,
@@ -4181,7 +4178,7 @@ mod tests {
 
         // 4) Root with no entries that only points at a subtree is not trimmed, so not canonical.
         let inner = node(None, &[(&zeros[0], None)]);
-        let untrimmed = node(Some(inner.0), &[]);
+        let untrimmed = node(Some(inner.0.clone()), &[]);
         assert!(lookup(&[inner, untrimmed.clone()], untrimmed.0, &zeros[0]).is_err());
     }
 
@@ -4210,30 +4207,30 @@ mod tests {
         let dev_bytes = encode_device_cbor("ed25519", 0x33, 32);
         let dev_cid = verify::compute_dagcbor_cid(&dev_bytes);
         let mut mst_map = BTreeMap::new();
-        mst_map.insert(dev_path.to_string(), dev_cid);
+        mst_map.insert(dev_path.to_string(), dev_cid.clone());
         let mst_bytes = verify::encode_mst_leaf_cbor(&mst_map);
         let mst_cid = verify::compute_dagcbor_cid(&mst_bytes);
-        let unsigned = verify::encode_unsigned_v3_commit_cbor(did, rev, mst_cid, None);
+        let unsigned = verify::encode_unsigned_v3_commit_cbor(did, rev, mst_cid.clone(), None);
         let sig = verify::sign_k256_low_s(&real_sk, &unsigned);
-        let signed = verify::encode_signed_v3_commit_cbor(did, rev, mst_cid, None, sig);
+        let signed = verify::encode_signed_v3_commit_cbor(did, rev, mst_cid.clone(), None, sig);
         let root_cid = verify::compute_dagcbor_cid(&signed);
 
         // 1) Wrong `#atproto` key triggers 1 initial lookup + 1 force-refresh retry, then propagates Err!
         let valid_car = verify::encode_car_v1(
-            &[root_cid],
+            std::slice::from_ref(&root_cid),
             &[
-                (root_cid, signed.clone()),
-                (mst_cid, mst_bytes.clone()),
-                (dev_cid, dev_bytes.clone()),
+                (root_cid.clone(), signed.clone()),
+                (mst_cid.clone(), mst_bytes.clone()),
+                (dev_cid.clone(), dev_bytes.clone()),
             ],
         );
         let msg_wrong_key = build_subscribe_repos_commit_msg(
             did,
             rev,
             10,
-            root_cid,
+            root_cid.clone(),
             valid_car.clone(),
-            vec![("create", dev_path, Some(dev_cid))],
+            vec![("create", dev_path, Some(dev_cid.clone()))],
         );
         let err = consumer
             .handle_event(msg_wrong_key)
@@ -4256,12 +4253,12 @@ mod tests {
             did,
             rev,
             11,
-            root_cid,
+            root_cid.clone(),
             valid_car,
             vec![(
                 "create",
                 "blue.catbird.chat.device/3l7spoofed",
-                Some(dev_cid),
+                Some(dev_cid.clone()),
             )],
         );
         let err_mst = consumer
@@ -4279,7 +4276,7 @@ mod tests {
             did,
             rev,
             12,
-            root_cid,
+            root_cid.clone(),
             vec![],
             vec![("delete", dev_path, None)],
         );

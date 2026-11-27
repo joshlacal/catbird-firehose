@@ -98,10 +98,7 @@ mod tests {
     #[test]
     fn links_and_bytes_stay_unclassifiable() {
         let cid = Cid::for_dag_cbor(b"blob");
-        let with_link = object(vec![(
-            "embed",
-            object(vec![("ref", Value::Link(cid))]),
-        )]);
+        let with_link = object(vec![("embed", object(vec![("ref", Value::Link(cid))]))]);
         assert_eq!(
             dag_cbor_record_to_json(&petrel_core::dagcbor::encode(&with_link)),
             Err(RecordJsonError::Unrepresentable("CID link"))
