@@ -6,13 +6,16 @@ pub mod models;
 pub mod queue;
 pub mod subscriptions;
 
+pub mod record_json;
+
 use std::collections::HashSet;
-use std::io::Cursor;
 use std::sync::Arc;
 
 use anyhow::{anyhow, Result};
-use atrium_repo::blockstore::{AsyncBlockStoreRead, CarStore};
 use catbird_firehose_fanout::Consumer;
+use petrel_core::Cid;
+use petrel_firehose::car::DEFAULT_MAX_CAR_BYTES;
+use petrel_firehose::{DiffCarBlockReader, ParsedCarArchive};
 use jacquard_api::com_atproto::sync::subscribe_repos::SubscribeReposMessage;
 use sqlx::{Pool, Postgres};
 use tokio::sync::{watch, RwLock};
@@ -118,10 +121,8 @@ impl PushConsumer {
             _ => return Err(anyhow!("Unsupported collection type: {}", collection)),
         }
 
-        let value: serde_json::Value = serde_ipld_dagcbor::from_slice(record_block)
-            .map_err(|err| anyhow!("Failed to deserialize {} record: {}", collection, err))?;
-
-        Ok(value)
+        record_json::dag_cbor_record_to_json(record_block)
+            .map_err(|err| anyhow!("Failed to deserialize {} record: {}", collection, err))
     }
 }
 
@@ -150,9 +151,8 @@ impl Consumer for PushConsumer {
             return Ok(());
         }
 
-        let mut car_store = CarStore::open(Cursor::new(&commit.blocks[..]))
-            .await
-            .map_err(|err| anyhow!("Failed to open CarStore: {}", err))?;
+        let car = ParsedCarArchive::parse(&commit.blocks, DEFAULT_MAX_CAR_BYTES, false)
+            .map_err(|err| anyhow!("Failed to parse commit CAR: {}", err))?;
 
         let repo_did = commit.repo.to_string();
 
@@ -176,7 +176,7 @@ impl Consumer for PushConsumer {
                 None => continue,
             };
 
-            let cid = match cid_link.to_ipld() {
+            let cid = match Cid::parse(cid_link.as_str()) {
                 Ok(cid) => cid,
                 Err(err) => {
                     error!("Invalid CID format: {}", err);
@@ -184,19 +184,12 @@ impl Consumer for PushConsumer {
                 }
             };
 
-            let mut record_block = Vec::new();
-            match car_store.read_block_into(cid, &mut record_block).await {
-                Ok(()) => {}
-                Err(err) => {
-                    debug!(
-                        "Record block not found for CID: {}, error: {}",
-                        cid_link, err
-                    );
-                    continue;
-                }
-            }
+            let Some(record_block) = car.block_bytes(&cid) else {
+                debug!("Record block not found for CID: {}", cid_link);
+                continue;
+            };
 
-            let record_data = match Self::deserialize_record(collection, &record_block) {
+            let record_data = match Self::deserialize_record(collection, record_block) {
                 Ok(data) => data,
                 Err(err) => {
                     debug!("Failed to deserialize {}: {}", collection, err);
